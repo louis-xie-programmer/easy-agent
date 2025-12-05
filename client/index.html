@@ -1,0 +1,371 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 编程助手</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f7fa;
+        }
+        .chat-container {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .chat-header {
+            padding: 15px 20px;
+            background: #4a6cf7;
+            color: white;
+            text-align: center;
+        }
+        .chat-messages {
+            height: 500px;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .message {
+            max-width: 80%;
+            padding: 12px 15px;
+            border-radius: 18px;
+            line-height: 1.5;
+        }
+        .user-message {
+            align-self: flex-end;
+            background: #4a6cf7;
+            color: white;
+            border-bottom-right-radius: 5px;
+        }
+        .ai-message {
+            align-self: flex-start;
+            background: #e9ecef;
+            border-bottom-left-radius: 5px;
+        }
+        .input-area {
+            display: flex;
+            padding: 15px;
+            border-top: 1px solid #eee;
+            background: white;
+        }
+        #message-input {
+            flex: 1;
+            padding: 12px 15px;
+            border: 1px solid #ddd;
+            border-radius: 20px;
+            margin-right: 10px;
+            font-size: 16px;
+        }
+        #send-button {
+            background: #4a6cf7;
+            color: white;
+            border: none;
+            border-radius: 20px;
+            padding: 0 20px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        #send-button:hover {
+            background: #3a5ce5;
+        }
+        .status {
+            text-align: center;
+            padding: 10px;
+            font-size: 14px;
+            color: #666;
+        }
+        .thinking {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #666;
+            border-radius: 50%;
+            margin: 0 2px;
+            animation: pulse 1.5s infinite;
+        }
+        .thinking:nth-child(2) { animation-delay: 0.2s; }
+        .thinking:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes pulse {
+            0%, 100% { opacity: 0.4; transform: scale(0.8); }
+            50% { opacity: 1; transform: scale(1); }
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <h2>AI 编程助手</h2>
+        </div>
+        
+        <div class="chat-messages" id="chat-messages">
+            <div class="message ai-message">
+                你好！我是AI编程助手，可以帮你审查代码、编写测试、运行沙箱代码等。请输入你的问题。
+            </div>
+        </div>
+        
+        <div class="status" id="status">
+            状态: <span id="connection-status">等待连接...</span>
+        </div>
+        
+        <div class="input-area">
+            <input type="text" id="message-input" placeholder="输入你的问题..." autofocus>
+            <button id="send-button">发送</button>
+        </div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const chatMessages = document.getElementById('chat-messages');
+            const messageInput = document.getElementById('message-input');
+            const sendButton = document.getElementById('send-button');
+            const connectionStatus = document.getElementById('connection-status');
+            
+            let ws = null;
+            let isThinking = false;
+
+            // 连接WebSocket
+            function connectWebSocket() {
+                connectionStatus.textContent = '连接中...';
+                
+                const wsUrl = `ws://${window.location.host}/ws`;
+                ws = new WebSocket(wsUrl);
+
+                ws.onopen = () => {
+                    connectionStatus.textContent = '已连接';
+                    connectionStatus.style.color = '#28a745';
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        handleWebSocketMessage(data);
+                    } catch (e) {
+                        console.error('消息解析失败:', e, event.data);
+                    }
+                };
+
+                ws.onerror = (error) => {
+                    console.error('WebSocket错误:', error);
+                    connectionStatus.textContent = '连接错误';
+                    connectionStatus.style.color = '#dc3545';
+                };
+
+                ws.onclose = (event) => {
+                    connectionStatus.textContent = `已断开 (${event.code})`;
+                    connectionStatus.style.color = '#dc3545';
+                    
+                    // 尝试重连
+                    setTimeout(connectWebSocket, 3000);
+                };
+            }
+
+            // 处理WebSocket消息
+            function handleWebSocketMessage(data) {
+                switch(data.type) {
+                    case 'status':
+                        console.log('接收到状态消息:', data.data);
+                        if (data.data === 'start_stream') {
+                            isThinking = true;
+                            addThinkingIndicator();
+                        }
+                        break;
+                    
+                    case 'token':
+                        console.log('接收到TOKEN消息:', data.text);
+                        // 直接使用data.text作为内容，避免正则匹配问题
+                        let text = data.text || '';
+                        
+                        if (text.trim()) {
+                            if (isThinking) {
+                                removeThinkingIndicator();
+                                isThinking = false;
+                            }
+                            appendAIMessage(text);
+                            scrollToBottom();
+                        }
+                        break;
+                    
+                    case 'final':
+                        // 处理最终结果
+                        appendAIMessage(data.text, true);
+                        if (isThinking) {
+                            removeThinkingIndicator();
+                            isThinking = false;
+                        }
+                        scrollToBottom();
+                        break;
+                    
+                    case 'done':
+                        // 流式传输完成，确保思考指示器已移除
+                        if (isThinking) {
+                            removeThinkingIndicator();
+                            isThinking = false;
+                        }
+                        break;
+                    
+                    case 'error':
+                        console.error('接收到错误消息:', data.error);
+                        // 处理错误消息
+                        appendSystemMessage(`错误: ${data.error}`);
+                        if (isThinking) {
+                            removeThinkingIndicator();
+                            isThinking = false;
+                        }
+                        scrollToBottom();
+                        break;
+                }
+            }
+
+            // 添加用户消息
+            function addUserMessage(text) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message user-message';
+                messageDiv.textContent = text;
+                chatMessages.appendChild(messageDiv);
+            }
+
+            // 添加AI消息
+            function appendAIMessage(text, isFinal = false) {
+                let lastAIMessage = chatMessages.lastElementChild;
+                if (!lastAIMessage || !lastAIMessage.classList.contains('ai-message')) {
+                    lastAIMessage = document.createElement('div');
+                    lastAIMessage.className = 'message ai-message';
+                    chatMessages.appendChild(lastAIMessage);
+                }
+                
+                // 如果是最终消息或错误消息，确保清除思考指示器
+                if (isFinal) {
+                    const thinkingIndicator = lastAIMessage.querySelector('.thinking-container');
+                    if (thinkingIndicator) thinkingIndicator.remove();
+                }
+                
+                // 智能文本处理：避免重复标点、保持中文流畅性
+                let currentText = lastAIMessage.textContent;
+                if (currentText && text) {
+                    // 避免重复的标点符号
+                    if (/[,.;!?，。；！？]$/.test(currentText) && /^[,.;!?，。；！？]/.test(text)) {
+                        text = text.substring(1);
+                    }
+                    // 避免重复的空格/换行
+                    if (/[ \n\r\t]+$/.test(currentText) && /^[ \n\r\t]/.test(text)) {
+                        text = text.trimStart();
+                    }
+                }
+                
+                // 只有在有实际内容时才更新
+                if (text.trim()) {
+                    // 防止重复追加相同内容
+                    if (!currentText.endsWith(text)) {
+                        lastAIMessage.textContent = currentText + text;
+                    }
+                }
+            }
+
+            // 添加系统消息
+            function appendSystemMessage(text) {
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message';
+                messageDiv.style.textAlign = 'center';
+                messageDiv.style.backgroundColor = '#fff3cd';
+                messageDiv.style.color = '#856404';
+                messageDiv.style.borderRadius = '4px';
+                messageDiv.style.padding = '8px';
+                messageDiv.textContent = text;
+                chatMessages.appendChild(messageDiv);
+                scrollToBottom();
+            }
+
+            // 添加思考指示器
+            function addThinkingIndicator() {
+                // 避免重复添加思考指示器
+                if (document.querySelector('.thinking-container')) {
+                    return;
+                }
+                
+                const thinkingDiv = document.createElement('div');
+                thinkingDiv.className = 'thinking-container';
+                thinkingDiv.innerHTML = `
+                    <span class="thinking"></span>
+                    <span class="thinking"></span>
+                    <span class="thinking"></span>
+                `;
+                
+                const lastAIMessage = chatMessages.lastElementChild;
+                if (lastAIMessage && lastAIMessage.classList.contains('ai-message')) {
+                    lastAIMessage.appendChild(thinkingDiv);
+                } else {
+                    const newMessage = document.createElement('div');
+                    newMessage.className = 'message ai-message';
+                    newMessage.appendChild(thinkingDiv);
+                    chatMessages.appendChild(newMessage);
+                }
+                scrollToBottom();
+            }
+
+            // 移除思考指示器
+            function removeThinkingIndicator() {
+                const thinkingContainer = document.querySelector('.thinking-container');
+                if (thinkingContainer) {
+                    // 保留AI消息框，只移除思考指示器
+                    thinkingContainer.remove();
+                }
+            }
+
+            // 滚动到底部
+            function scrollToBottom() {
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+
+            // 发送消息
+            function sendMessage() {
+                const text = messageInput.value.trim();
+                if (!text) return;
+
+                addUserMessage(text);
+                messageInput.value = '';
+                
+                const message = {
+                    type: 'prompt',
+                    payload: { prompt: text }
+                };
+                
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify(message));
+                } else {
+                    appendSystemMessage('连接未就绪，请稍候...');
+                    setTimeout(() => {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify(message));
+                        }
+                    }, 500);
+                }
+                
+                scrollToBottom();
+            }
+
+            // 事件监听
+            sendButton.addEventListener('click', sendMessage);
+            
+            messageInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    sendMessage();
+                }
+            });
+
+            // 初始化连接
+            connectWebSocket();
+        });
+    </script>
+</body>
+</html>
