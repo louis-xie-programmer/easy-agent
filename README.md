@@ -1,4 +1,4 @@
-# Golang-Agent
+# Easy-Agent
 
 一个基于 Ollama 的 AI 编程助手代理服务，提供代码审查、沙箱执行、文件操作等能力。
 
