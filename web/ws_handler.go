@@ -1,13 +1,11 @@
 package web
 
 import (
-	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"log"
-	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/louis-xie-programmer/easy-agent/agent"
@@ -30,7 +28,90 @@ type WSMessage struct {
 }
 
 type WSPrompt struct {
-	Prompt string `json:"prompt"`
+	Prompt    string `json:"prompt"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+// bufferedConnWriter 适配器将WebSocket连接包装为io.Writer接口
+// 实现Write方法，将数据作为token消息发送到客户端
+// 满足OllamaClient.StreamCall的writer参数要求
+type bufferedConnWriter struct {
+	conn   *websocket.Conn
+	buffer bytes.Buffer
+	mu     sync.Mutex
+}
+
+func (cw *bufferedConnWriter) Write(p []byte) (n int, err error) {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+
+	// 将数据累积到缓冲区
+	cw.buffer.Write(p)
+
+	// 当缓冲区足够大时才发送
+	if cw.buffer.Len() >= 1024 {
+		err = cw.flush()
+	}
+
+	return len(p), err
+}
+
+func (cw *bufferedConnWriter) flush() error {
+	if cw.buffer.Len() == 0 {
+		return nil
+	}
+
+	connMutex.Lock()
+	defer connMutex.Unlock()
+	
+	// 将缓冲区内容作为token消息发送
+	err := cw.conn.WriteJSON(map[string]any{
+		"type": "token",
+		"text": cw.buffer.String(),
+	})
+
+	// 重置缓冲区
+	cw.buffer.Reset()
+	return err
+}
+
+// 添加一个映射来跟踪所有活动连接
+var (
+	clients   = make(map[*websocket.Conn]bool)
+	mutex     = sync.RWMutex{}
+	connMutex = sync.Mutex{} // 添加连接写入互斥锁
+)
+
+// 添加定期ping所有客户端的函数
+func init() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			mutex.RLock()
+			clientsCopy := make(map[*websocket.Conn]bool)
+			for k, v := range clients {
+				clientsCopy[k] = v
+			}
+			mutex.RUnlock()
+
+			for client := range clientsCopy {
+				connMutex.Lock()
+				err := client.WriteJSON(map[string]any{
+					"type": "ping",
+				})
+				connMutex.Unlock()
+				if err != nil {
+					log.Printf("Ping to client failed: %v", err)
+					// 移除失效的连接
+					mutex.Lock()
+					delete(clients, client)
+					mutex.Unlock()
+				}
+			}
+		}
+	}()
 }
 
 func WebSocketHandler(a *agent.Agent, ollamaURL string, model string) http.HandlerFunc {
@@ -42,6 +123,18 @@ func WebSocketHandler(a *agent.Agent, ollamaURL string, model string) http.Handl
 			return
 		}
 		defer conn.Close()
+
+		// 添加连接到客户端列表
+		mutex.Lock()
+		clients[conn] = true
+		mutex.Unlock()
+
+		// 从客户端列表中移除连接
+		defer func() {
+			mutex.Lock()
+			delete(clients, conn)
+			mutex.Unlock()
+		}()
 
 		log.Println("[WS] client connected")
 
@@ -58,161 +151,93 @@ func WebSocketHandler(a *agent.Agent, ollamaURL string, model string) http.Handl
 			switch msg.Type {
 
 			case "ping":
+				connMutex.Lock()
 				conn.WriteJSON(map[string]any{"type": "pong"})
+				connMutex.Unlock()
 				continue
 
 			case "prompt":
 				// 解析 prompt 内容
 				var p WSPrompt
-				json.Unmarshal(msg.Payload, &p)
+				if err := json.Unmarshal(msg.Payload, &p); err != nil {
+					connMutex.Lock()
+					conn.WriteJSON(map[string]any{
+						"type":  "error",
+						"error": "invalid prompt format",
+					})
+					connMutex.Unlock()
+					continue
+				}
 
 				if p.Prompt == "" {
+					connMutex.Lock()
 					conn.WriteJSON(map[string]any{
 						"type":  "error",
 						"error": "prompt is empty",
 					})
+					connMutex.Unlock()
 					continue
 				}
 
 				// 异步处理（不会阻塞 WS reader）
-				go handlePromptWS(conn, a, ollamaURL, model, p.Prompt)
+				go handlePromptWS(conn, a, ollamaURL, model, p.Prompt, p.SessionID)
 
 			default:
+				connMutex.Lock()
 				conn.WriteJSON(map[string]any{
 					"type":  "error",
 					"error": "unknown ws event",
 				})
+				connMutex.Unlock()
 			}
 		}
 	}
 }
 
-func handlePromptWS(conn *websocket.Conn, a *agent.Agent, ollamaURL, model, prompt string) {
-
+func handlePromptWS(conn *websocket.Conn, a *agent.Agent, ollamaURL, model, prompt string, sessionID string) {
 	// 通知前端开始
-	conn.WriteJSON(map[string]any{
+	connMutex.Lock()
+	err := conn.WriteJSON(map[string]any{
 		"type": "status",
 		"data": "start_stream",
 	})
-
-	// 构造请求给 Ollama
-	body := map[string]any{
-		"model": model,
-		"messages": []map[string]string{
-			{"role": "system", "content": "你是一个本地 DeepSeek-R1 智能体，资深的 go 编程专家。"},
-			{"role": "user", "content": prompt},
-		},
-		"stream": true,
-	}
-
-	bs, _ := json.Marshal(body)
-
-	req, err := http.NewRequest("POST", ollamaURL, bytes.NewReader(bs))
+	connMutex.Unlock()
 	if err != nil {
-		conn.WriteJSON(map[string]any{"type": "error", "error": err.Error()})
 		return
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-
-	// 使用与OllamaClient相同的超时时间
-	ctx, cancel := context.WithTimeout(context.Background(), 3000*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx)
-
-	resp, err := http.DefaultClient.Do(req)
+	// 直接使用Agent处理会话，确保会话连续性
+	ans, err := a.RunWithSession(prompt, sessionID)
 	if err != nil {
+		connMutex.Lock()
 		conn.WriteJSON(map[string]any{
-			"type":  "warn",
-			"error": "ollama no stream; fallback to agent",
+			"type":  "error",
+			"error": err.Error(),
 		})
-
-		// fallback：一次性结果
-		ans, _ := a.Run(prompt)
-
-		conn.WriteJSON(map[string]any{
-			"type": "final",
-			"text": ans,
-		})
+		connMutex.Unlock()
 		return
 	}
-	defer resp.Body.Close()
 
-	reader := bufio.NewReader(resp.Body)
-	buf := make([]byte, 0, 4096)
-
-	// 流式 token 读取
-	for {
-		line, isPrefix, err := reader.ReadLine()
-
+	// 流式发送结果
+	for _, char := range ans {
+		connMutex.Lock()
+		err := conn.WriteJSON(map[string]any{
+			"type": "token",
+			"text": string(char),
+		})
+		connMutex.Unlock()
 		if err != nil {
-			// 区分不同类型的错误
-			netErr, ok := err.(net.Error)
-			if ok && netErr.Timeout() {
-				log.Printf("Ollama响应超时: %v", err)
-			} else {
-				log.Printf("流式读取错误: %v", err)
-			}
-			break
+			return
 		}
-
-		buf = append(buf, line...)
-		if isPrefix {
-			continue
-		}
-
-		chunk := string(buf)
-		buf = buf[:0]
-
-		// 解析Ollama流式响应格式
-		var response struct {
-			Model     string `json:"model"`
-			CreatedAt string `json:"created_at"`
-			Message   struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"message"`
-			Thinking string `json:"thinking"`
-			Done     bool   `json:"done"`
-		}
-
-		if err := json.Unmarshal([]byte(chunk), &response); err == nil {
-			// 优先处理thinking字段（如果有）
-			if response.Thinking != "" {
-				conn.WriteJSON(map[string]any{
-					"type": "token",
-					"text": response.Thinking,
-				})
-				// 处理content字段
-			} else if response.Message.Content != "" {
-				conn.WriteJSON(map[string]any{
-					"type": "token",
-					"text": response.Message.Content,
-				})
-			}
-			// 处理完成状态
-			if response.Done {
-				conn.WriteJSON(map[string]any{
-					"type": "done",
-					"data": "stream_complete",
-				})
-				return // 正常结束，返回避免重复发送done
-			}
-		} else {
-			log.Printf("无法解析Ollama响应: %s", chunk)
-		}
+		// 简短延迟以模拟流式效果
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	// 确保结束事件只发送一次
-	select {
-	case <-ctx.Done():
-		log.Println("请求上下文已取消")
-	default:
-		// 只有在非正常结束时才发送done
-		conn.WriteJSON(map[string]any{
-			"type": "done",
-			"data": "stream_complete",
-		})
-	}
-
+	// 发送完成状态
+	connMutex.Lock()
+	conn.WriteJSON(map[string]any{
+		"type": "done",
+		"data": "stream_complete",
+	})
+	connMutex.Unlock()
 }

@@ -1,3 +1,4 @@
+// ollama.go
 // agent 包中的Ollama客户端模块，负责：
 // - 定义与Ollama兼容的API请求/响应结构体
 // - 实现HTTP通信逻辑
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -35,6 +37,7 @@ type ChatRequest struct {
 	Messages   []ChatMessage `json:"messages"`
 	Tools      any           `json:"tools,omitempty"`
 	ToolChoice string        `json:"tool_choice,omitempty"`
+	Stream     bool          `json:"stream,omitempty"` // 添加流式支持
 }
 
 // FunctionCall 表示模型建议执行的函数调用
@@ -57,13 +60,23 @@ type ChoiceMessage struct {
 	Content      string        `json:"content,omitempty"`
 	FunctionCall *FunctionCall `json:"function_call,omitempty"`
 	Name         string        `json:"name,omitempty"`
+	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"` // 添加对tool_calls的支持
+}
+
+// ToolCall 表示模型建议执行的工具调用
+// Name: 工具名称
+// Arguments: 工具参数
+type ToolCall struct {
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments"`
 }
 
 // Choice 表示一个完整的响应选项
 // 包含一条Message
 // Ollama API可能返回多个选择，当前只处理第一个
 type Choice struct {
-	Message ChoiceMessage `json:"message"`
+	Message      ChoiceMessage `json:"message"`
+	FinishReason string        `json:"finish_reason,omitempty"`
 }
 
 // ChatResponse 表示从Ollama接收到的完整响应
@@ -87,22 +100,39 @@ type OllamaClient struct {
 
 // NewOllamaClient 创建新的Ollama客户端实例
 // 参数：
-//   url: Ollama服务的API端点
-//   timeout: HTTP请求超时时间
-// 默认使用deepseek-r1:1.5b模型
+//
+//	url: Ollama服务的API端点
+//	timeout: HTTP请求超时时间
+//
+// 默认使用支持工具调用的deepseek-r1模型
 // 返回值：初始化的OllamaClient指针
 func NewOllamaClient(url string, timeout time.Duration) *OllamaClient {
+	// 增加最小超时时间，确保至少有90秒的处理时间
+	if timeout < 90*time.Second {
+		timeout = 90 * time.Second
+	}
+
 	return &OllamaClient{
-		url:    url,
-		client: &http.Client{Timeout: timeout},
-		model:  "deepseek-r1:1.5b",
+		url: url,
+		client: &http.Client{
+			Timeout: timeout,
+			// 添加连接池配置
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     30 * time.Second,
+			},
+		},
+		model: "qwen3-vl:4b", // 使用支持工具调用的模型
 	}
 }
 
 // Call 方法向Ollama服务发送聊天请求
 // 参数：
-//   promptMessages: 对话历史消息
-//   tools: 工具元数据（可选）
+//
+//	promptMessages: 对话历史消息
+//	tools: 工具元数据（可选）
+//
 // 返回值：API响应和错误信息
 // 实现完整的HTTP请求-响应流程，包括：
 // - 请求序列化
@@ -110,19 +140,27 @@ func NewOllamaClient(url string, timeout time.Duration) *OllamaClient {
 // - 响应处理
 // - 错误转换
 func (o *OllamaClient) Call(promptMessages []ChatMessage, tools any) (*ChatResponse, error) {
+	LogAsync("INFO", fmt.Sprintf("发起API调用，消息数量: %d", len(promptMessages)))
 	reqBody := ChatRequest{
-		Model:    o.model,
-		Messages: promptMessages,
+		Model:      o.model,
+		Messages:   promptMessages,
 		Tools:      tools,
 		ToolChoice: "auto",
+		Stream:     false, // 非流式调用
 	}
+
 	// 将请求体转换为JSON
-	bs, _ := json.Marshal(reqBody)
+	bs, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
 	// 创建HTTP请求
 	req, err := http.NewRequest("POST", o.url, bytes.NewReader(bs))
 	if err != nil {
 		return nil, err
 	}
+
 	// 设置请求头
 	req.Header.Set("Content-Type", "application/json")
 	// Ollama本地安装不需要API密钥
@@ -130,17 +168,29 @@ func (o *OllamaClient) Call(promptMessages []ChatMessage, tools any) (*ChatRespo
 	// If Ollama requires any API key header, set it via env and uncomment:
 	// req.Header.Set("Authorization", "Bearer "+os.Getenv("OLLAMA_API_KEY"))
 
+	// 不要创建新的超时上下文，使用传入的上下文
+	// 如果没有上下文，则使用客户端默认超时
+	// 检查请求是否已经有上下文
+	/*if req.Context() == context.Background() {
+		// 只有在没有上下文时才应用默认超时
+		ctx, cancel := context.WithTimeout(context.Background(), o.client.Timeout)
+		defer cancel()
+		req = req.WithContext(ctx)
+	}*/
+
 	resp, err := o.client.Do(req)
 	if err != nil {
+		LogAsync("ERROR", fmt.Sprintf("HTTP request to Ollama failed: %v", err))
 		return nil, err
 	}
 	defer resp.Body.Close()
-	
+
 	// 检查HTTP状态码
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("ollama error: %d %s", resp.StatusCode, string(body))
 	}
+
 	// Ollama /api/chat 返回的是 application/x-ndjson 流式响应
 	// 需要逐行解析每个 JSON 对象
 	decoder := json.NewDecoder(resp.Body)
@@ -168,6 +218,22 @@ func (o *OllamaClient) Call(promptMessages []ChatMessage, tools any) (*ChatRespo
 					})
 				}
 				finalResponse.Choices[0].Message.Content += content
+
+				// 检查是否包含工具调用（文本形式）
+				if toolCalls := o.extractToolCalls(content); len(toolCalls) > 0 {
+					finalResponse.Choices[0].Message.ToolCalls = toolCalls
+				}
+			}
+
+			// 检查是否是结束标记
+			if done, ok := chunk["done"].(bool); ok && done {
+				if finishReason, ok := chunk["finish_reason"].(string); ok {
+					if len(finalResponse.Choices) == 0 {
+						finalResponse.Choices = append(finalResponse.Choices, Choice{})
+					}
+					finalResponse.Choices[0].FinishReason = finishReason
+				}
+				break
 			}
 		}
 	}
@@ -177,4 +243,120 @@ func (o *OllamaClient) Call(promptMessages []ChatMessage, tools any) (*ChatRespo
 	}
 
 	return &finalResponse, nil
+}
+
+// extractToolCalls 从文本内容中提取工具调用信息
+func (o *OllamaClient) extractToolCalls(content string) []ToolCall {
+	// 查找类似 {"name": "...", "parameters": {...}} 的模式
+	// 这是deepseek-r1-tool-calling模型返回工具调用的方式
+
+	// 简单的启发式方法：查找JSON对象
+	var toolCalls []ToolCall
+
+	// 查找第一个 '{' 和最后一个 '}'
+	start := strings.Index(content, "{")
+	end := strings.LastIndex(content, "}")
+
+	if start >= 0 && end > start {
+		jsonStr := content[start : end+1]
+
+		// 尝试解析为工具调用
+		var toolCallMap map[string]interface{}
+		if err := json.Unmarshal([]byte(jsonStr), &toolCallMap); err == nil {
+			if name, ok := toolCallMap["name"].(string); ok {
+				// 检查是否有parameters字段
+				if params, ok := toolCallMap["parameters"]; ok {
+					toolCall := ToolCall{
+						Name:      name,
+						Arguments: make(map[string]interface{}),
+					}
+
+					// 将parameters转换为map[string]interface{}
+					if paramsMap, ok := params.(map[string]interface{}); ok {
+						toolCall.Arguments = paramsMap
+					}
+
+					toolCalls = append(toolCalls, toolCall)
+				}
+			}
+		}
+	}
+
+	return toolCalls
+}
+
+// StreamCall 实时流式处理Ollama响应
+// 直接将content流式写入writer，避免内容重组
+// 参数：
+//
+//	writer - 实现io.Writer接口的目标流（如WebSocket连接）
+func (o *OllamaClient) StreamCall(promptMessages []ChatMessage, tools any, writer io.Writer) error {
+	reqBody := ChatRequest{
+		Model:      o.model,
+		Messages:   promptMessages,
+		Tools:      tools,
+		ToolChoice: "auto",
+		Stream:     true, // 启用流式调用
+	}
+
+	bs, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", o.url, bytes.NewReader(bs))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	// 不要创建新的超时上下文，使用传入的上下文
+	// 如果没有上下文，则使用客户端默认超时
+	// 检查请求是否已经有上下文
+	/*if req.Context() == context.Background() {
+		// 只有在没有上下文时才应用默认超时
+		ctx, cancel := context.WithTimeout(context.Background(), o.client.Timeout)
+		defer cancel()
+		req = req.WithContext(ctx)
+	}*/
+
+	resp, err := o.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("ollama error: %d %s", resp.StatusCode, string(body))
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	for {
+		var chunk map[string]interface{}
+		if err := decoder.Decode(&chunk); err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("failed to decode ollama response chunk: %w", err)
+		}
+
+		if errorMsg, ok := chunk["error"].(string); ok {
+			return fmt.Errorf("ollama error: %s", errorMsg)
+		}
+
+		if message, ok := chunk["message"].(map[string]interface{}); ok {
+			if content, ok := message["content"].(string); ok && content != "" {
+				if _, err := writer.Write([]byte(content)); err != nil {
+					return err
+				}
+			}
+		}
+
+		// 检查是否是结束标记
+		if done, ok := chunk["done"].(bool); ok && done {
+			break
+		}
+	}
+	return nil
 }

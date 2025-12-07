@@ -1,1 +1,7 @@
 /agent_memory.json
+/demo_session_memory.json
+/session_demo.go
+/tools_demo.go
+/request.json
+.idea/
+logs/

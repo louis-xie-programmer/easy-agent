@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -27,6 +26,18 @@
             background: #4a6cf7;
             color: white;
             text-align: center;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .chat-header h2 {
+            margin: 0;
+        }
+        .session-info {
+            font-size: 0.9em;
+            background: rgba(255, 255, 255, 0.2);
+            padding: 5px 10px;
+            border-radius: 15px;
         }
         .chat-messages {
             height: 500px;
@@ -53,11 +64,21 @@
             background: #e9ecef;
             border-bottom-left-radius: 5px;
         }
+        .system-message {
+            align-self: center;
+            background: #fff3cd;
+            color: #856404;
+            border-radius: 4px;
+            padding: 8px;
+            text-align: center;
+            max-width: 90%;
+        }
         .input-area {
             display: flex;
             padding: 15px;
             border-top: 1px solid #eee;
             background: white;
+            flex-wrap: wrap;
         }
         #message-input {
             flex: 1;
@@ -66,6 +87,7 @@
             border-radius: 20px;
             margin-right: 10px;
             font-size: 16px;
+            min-width: 200px;
         }
         #send-button {
             background: #4a6cf7;
@@ -78,6 +100,22 @@
         }
         #send-button:hover {
             background: #3a5ce5;
+        }
+        .toolbar {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+            width: 100%;
+        }
+        .toolbar button {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            background: white;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .toolbar button:hover {
+            background: #f8f9fa;
         }
         .status {
             text-align: center;
@@ -100,12 +138,101 @@
             0%, 100% { opacity: 0.4; transform: scale(0.8); }
             50% { opacity: 1; transform: scale(1); }
         }
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.4);
+        }
+        .modal-content {
+            background-color: #fefefe;
+            margin: 15% auto;
+            padding: 20px;
+            border: 1px solid #888;
+            width: 100%;
+            max-width: 500px;
+            border-radius: 5px;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .modal-header h3 {
+            margin: 0;
+        }
+        .close {
+            color: #aaa;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .close:hover {
+            color: black;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .form-actions {
+            text-align: right;
+        }
+        .form-actions button {
+            padding: 8px 16px;
+            margin-left: 10px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .btn-primary {
+            background-color: #4a6cf7;
+            color: white;
+        }
+        .btn-secondary {
+            background-color: #6c757d;
+            color: white;
+        }
+        .session-list {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .session-item {
+            padding: 10px;
+            border: 1px solid #ddd;
+            margin-bottom: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .session-item:hover {
+            background-color: #f8f9fa;
+        }
+        .session-item.active {
+            background-color: #e3f2fd;
+            border-color: #4a6cf7;
+        }
     </style>
 </head>
 <body>
     <div class="chat-container">
         <div class="chat-header">
             <h2>AI 编程助手</h2>
+            <div class="session-info" id="session-info">
+                会话: 默认会话
+            </div>
         </div>
         
         <div class="chat-messages" id="chat-messages">
@@ -121,6 +248,51 @@
         <div class="input-area">
             <input type="text" id="message-input" placeholder="输入你的问题..." autofocus>
             <button id="send-button">发送</button>
+            
+            <div class="toolbar">
+                <button id="new-session-btn">新建会话</button>
+                <button id="switch-session-btn">切换会话</button>
+                <label style="display: flex; align-items: center; margin: 0;">
+                    <input type="checkbox" id="useWebSearch" checked> 使用网络搜索
+                </label>
+            </div>
+        </div>
+    </div>
+
+    <!-- 新建会话模态框 -->
+    <div id="new-session-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>新建会话</h3>
+                <span class="close">&times;</span>
+            </div>
+            <div class="form-group">
+                <label for="session-title">会话标题:</label>
+                <input type="text" id="session-title" placeholder="请输入会话标题">
+            </div>
+            <div class="form-actions">
+                <button class="btn-secondary" id="cancel-new-session">取消</button>
+                <button class="btn-primary" id="confirm-new-session">创建</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 切换会话模态框 -->
+    <div id="switch-session-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>切换会话</h3>
+                <span class="close">&times;</span>
+            </div>
+            <div class="form-group">
+                <label>选择会话:</label>
+                <div class="session-list" id="session-list">
+                    <!-- 会话列表将在这里动态生成 -->
+                </div>
+            </div>
+            <div class="form-actions">
+                <button class="btn-secondary" id="cancel-switch-session">取消</button>
+            </div>
         </div>
     </div>
 
@@ -130,9 +302,26 @@
             const messageInput = document.getElementById('message-input');
             const sendButton = document.getElementById('send-button');
             const connectionStatus = document.getElementById('connection-status');
+            const sessionInfo = document.getElementById('session-info');
+            
+            // 会话相关元素
+            const newSessionBtn = document.getElementById('new-session-btn');
+            const switchSessionBtn = document.getElementById('switch-session-btn');
+            const newSessionModal = document.getElementById('new-session-modal');
+            const switchSessionModal = document.getElementById('switch-session-modal');
+            const closeNewSession = newSessionModal.querySelector('.close');
+            const closeSwitchSession = switchSessionModal.querySelector('.close');
+            const cancelNewSession = document.getElementById('cancel-new-session');
+            const confirmNewSession = document.getElementById('confirm-new-session');
+            const cancelSwitchSession = document.getElementById('cancel-switch-session');
+            const sessionTitleInput = document.getElementById('session-title');
+            const sessionList = document.getElementById('session-list');
             
             let ws = null;
             let isThinking = false;
+            let currentSessionId = null;
+            let sessions = {};
+            let pingInterval = null;
 
             // 连接WebSocket
             function connectWebSocket() {
@@ -144,6 +333,10 @@
                 ws.onopen = () => {
                     connectionStatus.textContent = '已连接';
                     connectionStatus.style.color = '#28a745';
+                    // 启动ping/pong机制
+                    startPing();
+                    // 连接成功后获取会话列表
+                    fetchSessions();
                 };
 
                 ws.onmessage = (event) => {
@@ -164,10 +357,52 @@
                 ws.onclose = (event) => {
                     connectionStatus.textContent = `已断开 (${event.code})`;
                     connectionStatus.style.color = '#dc3545';
+                    stopPing();
                     
                     // 尝试重连
                     setTimeout(connectWebSocket, 3000);
                 };
+            }
+
+            // 启动ping机制
+            function startPing() {
+                stopPing(); // 先清理现有的ping
+                pingInterval = setInterval(() => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'ping' }));
+                    }
+                }, 25000); // 每25秒发送一次ping
+            }
+
+            // 停止ping机制
+            function stopPing() {
+                if (pingInterval) {
+                    clearInterval(pingInterval);
+                    pingInterval = null;
+                }
+            }
+
+            // 获取会话列表
+            async function fetchSessions() {
+                try {
+                    const response = await fetch('/sessions');
+                    if (response.ok) {
+                        const data = await response.json();
+                        sessions = data.sessions || {};
+                        updateSessionInfo();
+                    }
+                } catch (error) {
+                    console.error('获取会话列表失败:', error);
+                }
+            }
+
+            // 更新会话信息显示
+            function updateSessionInfo() {
+                if (currentSessionId && sessions[currentSessionId]) {
+                    sessionInfo.textContent = `会话: ${sessions[currentSessionId].title}`;
+                } else {
+                    sessionInfo.textContent = '会话: 默认会话';
+                }
             }
 
             // 处理WebSocket消息
@@ -224,6 +459,13 @@
                         }
                         scrollToBottom();
                         break;
+                        
+                    case 'pong':
+                        // 心跳响应，无需处理
+                        break;
+                        
+                    default:
+                        console.log('未知消息类型:', data.type, data);
                 }
             }
 
@@ -275,12 +517,7 @@
             // 添加系统消息
             function appendSystemMessage(text) {
                 const messageDiv = document.createElement('div');
-                messageDiv.className = 'message';
-                messageDiv.style.textAlign = 'center';
-                messageDiv.style.backgroundColor = '#fff3cd';
-                messageDiv.style.color = '#856404';
-                messageDiv.style.borderRadius = '4px';
-                messageDiv.style.padding = '8px';
+                messageDiv.className = 'message system-message';
                 messageDiv.textContent = text;
                 chatMessages.appendChild(messageDiv);
                 scrollToBottom();
@@ -335,9 +572,14 @@
                 addUserMessage(text);
                 messageInput.value = '';
                 
+                const useWebSearch = document.getElementById('useWebSearch').checked;
+                const finalPrompt = useWebSearch ? `请先使用网络搜索工具获取最新信息，然后基于搜索结果回答以下问题：${text}` : text;
                 const message = {
                     type: 'prompt',
-                    payload: { prompt: text }
+                    payload: { 
+                        prompt: finalPrompt,
+                        session_id: currentSessionId
+                    }
                 };
                 
                 if (ws && ws.readyState === WebSocket.OPEN) {
@@ -354,12 +596,159 @@
                 scrollToBottom();
             }
 
+            // 显示新建会话模态框
+            function showNewSessionModal() {
+                sessionTitleInput.value = '';
+                newSessionModal.style.display = 'block';
+                sessionTitleInput.focus();
+            }
+
+            // 隐藏新建会话模态框
+            function hideNewSessionModal() {
+                newSessionModal.style.display = 'none';
+            }
+
+            // 显示切换会话模态框
+            function showSwitchSessionModal() {
+                fetchSessions().then(() => {
+                    renderSessionList();
+                    switchSessionModal.style.display = 'block';
+                });
+            }
+
+            // 隐藏切换会话模态框
+            function hideSwitchSessionModal() {
+                switchSessionModal.style.display = 'none';
+            }
+
+            // 渲染会话列表
+            function renderSessionList() {
+                sessionList.innerHTML = '';
+                
+                // 添加默认会话选项
+                const defaultSessionItem = document.createElement('div');
+                defaultSessionItem.className = 'session-item' + (!currentSessionId ? ' active' : '');
+                defaultSessionItem.innerHTML = '<strong>默认会话</strong><div style="font-size: 0.8em; color: #666;">无历史记录</div>';
+                defaultSessionItem.onclick = () => {
+                    currentSessionId = null;
+                    updateSessionInfo();
+                    appendSystemMessage('已切换到默认会话');
+                    hideSwitchSessionModal();
+                };
+                sessionList.appendChild(defaultSessionItem);
+                
+                // 添加其他会话
+                Object.keys(sessions).forEach(sessionId => {
+                    const session = sessions[sessionId];
+                    const sessionItem = document.createElement('div');
+                    sessionItem.className = 'session-item' + (currentSessionId === sessionId ? ' active' : '');
+                    sessionItem.innerHTML = `
+                        <strong>${session.title}</strong>
+                        <div style="font-size: 0.9em; color: #666;">
+                            创建时间: ${new Date(session.created_at).toLocaleString()}<br>
+                            消息数: ${session.message_count}
+                        </div>
+                    `;
+                    sessionItem.onclick = () => {
+                        switchToSession(sessionId, session.title);
+                    };
+                    sessionList.appendChild(sessionItem);
+                });
+            }
+
+            // 切换到指定会话
+            async function switchToSession(sessionId, title) {
+                try {
+                    const response = await fetch(`/session?id=${encodeURIComponent(sessionId)}`, {
+                        method: 'PUT'
+                    });
+                    
+                    if (response.ok) {
+                        currentSessionId = sessionId;
+                        updateSessionInfo();
+                        appendSystemMessage(`已切换到会话: ${title}`);
+                        hideSwitchSessionModal();
+                    } else {
+                        const errorData = await response.json();
+                        throw new Error(errorData.error || '切换会话失败');
+                    }
+                } catch (error) {
+                    console.error('切换会话失败:', error);
+                    alert('切换会话失败: ' + error.message);
+                }
+            }
+
+            // 创建新会话
+            async function createNewSession() {
+                const title = sessionTitleInput.value.trim();
+                if (!title) {
+                    alert('请输入会话标题');
+                    return;
+                }
+
+                try {
+                    // 调用后端API创建新会话
+                    const response = await fetch('/session', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ title: title })
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        // 设置当前会话为新创建的会话
+                        currentSessionId = data.session_id;
+                        updateSessionInfo();
+                        
+                        // 显示创建成功的消息
+                        appendSystemMessage(`会话 "${title}" 已创建并设为当前会话`);
+                        hideNewSessionModal();
+                        
+                        // 清空聊天记录以开始新会话
+                        chatMessages.innerHTML = '';
+                        const welcomeMessage = document.createElement('div');
+                        welcomeMessage.className = 'message ai-message';
+                        welcomeMessage.textContent = `你好！我是AI编程助手，在"${title}"会话中为您服务。请输入您的问题。`;
+                        chatMessages.appendChild(welcomeMessage);
+                    } else {
+                        const errorData = await response.json();
+                        throw new Error(errorData.error || '创建会话失败');
+                    }
+                } catch (error) {
+                    console.error('创建会话失败:', error);
+                    alert('创建会话失败: ' + error.message);
+                }
+            }
+
             // 事件监听
             sendButton.addEventListener('click', sendMessage);
             
             messageInput.addEventListener('keypress', (e) => {
                 if (e.key === 'Enter') {
                     sendMessage();
+                }
+            });
+
+            // 会话管理事件监听
+            newSessionBtn.addEventListener('click', showNewSessionModal);
+            switchSessionBtn.addEventListener('click', showSwitchSessionModal);
+            
+            closeNewSession.addEventListener('click', hideNewSessionModal);
+            closeSwitchSession.addEventListener('click', hideSwitchSessionModal);
+            cancelNewSession.addEventListener('click', hideNewSessionModal);
+            cancelSwitchSession.addEventListener('click', hideSwitchSessionModal);
+            
+            confirmNewSession.addEventListener('click', createNewSession);
+            
+            // 点击模态框外部关闭
+            window.addEventListener('click', (event) => {
+                if (event.target === newSessionModal) {
+                    hideNewSessionModal();
+                }
+                if (event.target === switchSessionModal) {
+                    hideSwitchSessionModal();
                 }
             });
 

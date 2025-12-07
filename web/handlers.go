@@ -2,6 +2,7 @@
 // - RESTful API端点
 // - SSE流式响应支持
 // - 请求解析与响应格式化
+// - 会话管理支持
 // 所有处理器都包装了核心Agent功能
 package web
 
@@ -11,33 +12,61 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/louis-xie-programmer/easy-agent/agent"
 )
+
+// AgentRequest 定义API请求结构
+type AgentRequest struct {
+	Prompt    string `json:"prompt"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+// AgentResponse 定义API响应结构
+type AgentResponse struct {
+	Answer    string `json:"answer"`
+	SessionID string `json:"session_id"`
+}
+
+// SessionCreateRequest 定义创建会话的请求结构
+type SessionCreateRequest struct {
+	Title string `json:"title"`
+}
+
+// SessionCreateResponse 定义创建会话的响应结构
+type SessionCreateResponse struct {
+	SessionID string `json:"session_id"`
+	Message   string `json:"message"`
+}
+
+// SessionsListResponse 定义会话列表的响应结构
+type SessionsListResponse struct {
+	Sessions map[string]map[string]interface{} `json:"sessions"`
+}
 
 // AgentHandler 处理POST /agent请求
 // 功能：
 //   1. 解析JSON请求体
-//   2. 调用Agent.Run执行业务逻辑
+//   2. 调用Agent.RunWithSession执行业务逻辑
 //   3. 返回JSON格式的响应
 //   4. 处理各种错误情况
 // 对应API端点：POST /agent
-// POST /agent  body: { "prompt": "..." }
+// POST /agent  body: { "prompt": "...", "session_id": "..." }
 // AgentHandler 创建处理函数
 // 参数：a 已初始化的Agent实例
 // 返回值：符合http.HandlerFunc签名的闭包函数
 func AgentHandler(a *agent.Agent) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// 解析请求体中的JSON数据
-		// 预期格式：{"prompt": "用户输入的提示"}
+		// 预期格式：{"prompt": "用户输入的提示", "session_id": "可选的会话ID"}
 		// 如果解析失败，返回400错误
-		var payload struct {
-			Prompt string `json:"prompt"`
-		}
+		var payload AgentRequest
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "bad request", 400)
 			return
 		}
-		ans, err := a.Run(payload.Prompt)
+		
+		ans, err := a.RunWithSession(payload.Prompt, payload.SessionID)
 		// 处理Agent执行过程中的错误
 		// 返回500内部服务器错误
 		// 错误信息包含具体的错误描述
@@ -45,9 +74,81 @@ func AgentHandler(a *agent.Agent) http.HandlerFunc {
 			http.Error(w, fmt.Sprintf("agent error: %v", err), 500)
 			return
 		}
-		resp := map[string]string{"answer": ans}
+		
+		response := AgentResponse{
+			Answer:    ans,
+			SessionID: a.GetMemory().GetCurrentSessionID(),
+		}
+		
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
+		_ = json.NewEncoder(w).Encode(response)
+	}
+}
+
+// CreateSessionHandler 处理POST /session请求，创建新会话
+func CreateSessionHandler(a *agent.Agent) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var payload SessionCreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "bad request: "+err.Error(), 400)
+			return
+		}
+		
+		if payload.Title == "" {
+			http.Error(w, "title is required", 400)
+			return
+		}
+		
+		// 生成新的会话ID
+		sessionID := uuid.New().String()
+		
+		// 创建会话
+		a.GetMemory().CreateSession(sessionID, payload.Title)
+		
+		response := SessionCreateResponse{
+			SessionID: sessionID,
+			Message:   fmt.Sprintf("会话 '%s' 已创建", payload.Title),
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(response)
+	}
+}
+
+// ListSessionsHandler 处理GET /sessions请求，列出所有会话
+func ListSessionsHandler(a *agent.Agent) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sessions := a.GetMemory().GetAllSessions()
+		response := SessionsListResponse{
+			Sessions: sessions,
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(response)
+	}
+}
+
+// SwitchSessionHandler 处理PUT /session/{id}请求，切换到指定会话
+func SwitchSessionHandler(a *agent.Agent) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 从查询参数获取会话ID
+		sessionID := r.URL.Query().Get("id")
+		if sessionID == "" {
+			http.Error(w, "session id is required", 400)
+			return
+		}
+		
+		if a.GetMemory().SetCurrentSession(sessionID) {
+			response := map[string]string{
+				"message": fmt.Sprintf("已切换到会话 ID: %s", sessionID),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(response)
+		} else {
+			http.Error(w, fmt.Sprintf("会话 ID '%s' 不存在", sessionID), 404)
+			return
+		}
 	}
 }
 
@@ -58,17 +159,20 @@ func AgentHandler(a *agent.Agent) http.HandlerFunc {
 //   - 异步执行代理任务
 //   - 连接关闭检测
 // 对应API端点：GET /stream
-// GET /stream?prompt=...
+// GET /stream?prompt=...&session_id=...
 // AgentStreamHandler 创建SSE处理函数
 // 参数：a 已初始化的Agent实例
 // 返回值：符合http.HandlerFunc签名的闭包函数
 func AgentStreamHandler(a *agent.Agent) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Query().Get("prompt")
+		sessionID := r.URL.Query().Get("session_id")
+		
 		if p == "" {
 			http.Error(w, "prompt required", 400)
 			return
 		}
+		
 		// Basic SSE streaming: send simple events (not full chunked streaming with intermediate model events)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -100,6 +204,7 @@ func AgentStreamHandler(a *agent.Agent) http.HandlerFunc {
 			http.Error(w, "streaming unsupported", 500)
 			return
 		}
+		
 		// 发送初始的meta事件
 		// 表示流式响应已开始
 		// heartbeat
@@ -118,7 +223,7 @@ func AgentStreamHandler(a *agent.Agent) http.HandlerFunc {
 			default:
 			}
 
-			ans, err := a.Run(p)
+			ans, err := a.RunWithSession(p, sessionID)
 			var out map[string]string
 			if err != nil {
 				out = map[string]string{"error": err.Error()}

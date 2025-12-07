@@ -1,3 +1,4 @@
+// websearch.go
 package agent
 
 import (
@@ -25,6 +26,7 @@ type SearchResult struct {
 }
 
 func WebSearch(args WebSearchArgs) ([]SearchResult, error) {
+	LogAsync("INFO", "Executing web_search tool")
 	if args.NumResults <= 0 {
 		args.NumResults = 5
 	}
