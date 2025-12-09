@@ -19,7 +19,7 @@ import (
 // mem: 会话记忆存储（用于持久化对话历史）
 type Agent struct {
 	ollama *OllamaClient
-	mem    *Memory
+	mem    *MemoryV3
 }
 
 // NewAgent 创建新的代理实例
@@ -29,12 +29,12 @@ type Agent struct {
 //	m: 内存存储，用于保存对话状态
 //
 // 返回值：初始化的Agent指针
-func NewAgent(o *OllamaClient, m *Memory) *Agent {
+func NewAgent(o *OllamaClient, m *MemoryV3) *Agent {
 	return &Agent{ollama: o, mem: m}
 }
 
 // GetMemory 获取Agent的内存实例
-func (a *Agent) GetMemory() *Memory {
+func (a *Agent) GetMemory() *MemoryV3 {
 	return a.mem
 }
 
@@ -48,7 +48,7 @@ func toolsMetadata() any {
 			"type": "function",
 			"function": map[string]any{
 				"name":        "web_search",
-				"description": "进行互联网搜索并返回 topN 结果，可选抓取页面正文。",
+				"description": "【强制触发】当用户查询涉及实时数据、统计数据、互联网信息或包含'搜索/查/获取最新'等关键词时必须调用。例如：CEO姓名、名人数量、最新新闻等。",
 				"parameters": map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -190,7 +190,7 @@ func (a *Agent) RunWithSession(prompt string, sessionID string) (string, error) 
 	if len(messages) == 0 {
 		// 初始化系统消息
 		messages = []ChatMessage{
-			{Role: "system", Content: "你是 AI 编程伙伴，资深的go编程专家，擅长审查代码、写测试、运行沙箱代码以及生成修复建议。需要调用工具时，请使用 function_call（JSON）。"},
+			{Role: "system", Content: "你是严格遵守规则的AI助手：\n1️⃣ 当用户请求涉及实时数据、统计数据、互联网信息或明确要求\"搜索\"时，必须调用web_search工具\n2️⃣ 禁止直接回答需要实时验证的问题（如CEO姓名、名人数量等）\n3️⃣ 需要调用工具时，必须生成符合OpenAI规范的function_call JSON"},
 		}
 	}
 
@@ -211,6 +211,14 @@ func (a *Agent) RunWithSession(prompt string, sessionID string) (string, error) 
 		if err != nil && strings.Contains(err.Error(), "does not support tools") {
 			LogAsync("WARN", "Model does not support tools, falling back to no-tools mode")
 			cr, err = a.ollama.Call(messages, nil)
+		}
+
+		// 新增：用户指令关键词强制触发检查
+		if containsSearchKeywords(prompt) && len(cr.Choices) > 0 && cr.Choices[0].Message.Content != "" {
+			if len(cr.Choices[0].Message.ToolCalls) == 0 {
+				LogAsync("WARN", "用户明确要求搜索但模型未触发工具，强制重试")
+				return a.RunWithSession("[强制搜索]"+prompt, sessionID)
+			}
 		}
 
 		if err != nil {
@@ -299,9 +307,40 @@ func (a *Agent) RunWithSession(prompt string, sessionID string) (string, error) 
 	return lastAnswer, fmt.Errorf("iteration limit reached")
 }
 
+// 用户指令关键词检测
+func containsSearchKeywords(text string) bool {
+	keywords := []string{"搜索", "查", "获取最新", "实时", "统计数据", "多少个"}
+	for _, k := range keywords {
+		if strings.Contains(text, k) {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *Agent) execTool(fc *FunctionCall, sessionID string) string {
 	fname := fc.Name
 	switch fname {
+	case "web_search":
+		LogAsync("INFO", "Executing web_search tool")
+		var args WebSearchArgs
+		_ = json.Unmarshal(fc.Arguments, &args)
+
+		// 新增：智能参数清洗（修复拼写错误）
+		if len(args.Query) > 15 && !strings.Contains(args.Query, " ") {
+			args.Query = fixQuerySpelling(args.Query)
+		}
+
+		// 新增：基础有效性验证
+		if !isValidQuery(args.Query) {
+			return "参数错误：搜索关键词需包含有效技术术语"
+		}
+
+		results, err := WebSearch(args)
+		if err != nil {
+			return "web search error: " + err.Error()
+		}
+		return MarshalArgs(results)
 	case "run_code":
 		LogAsync("INFO", "Executing run_code tool")
 		var args RunCodeArgs
@@ -322,15 +361,6 @@ func (a *Agent) execTool(fc *FunctionCall, sessionID string) string {
 		var args GitCmdArgs
 		_ = json.Unmarshal(fc.Arguments, &args)
 		return GitCmd(args)
-	case "web_search":
-		LogAsync("INFO", "Executing web_search tool")
-		var args WebSearchArgs
-		_ = json.Unmarshal(fc.Arguments, &args)
-		results, err := WebSearch(args)
-		if err != nil {
-			return "web search error: " + err.Error()
-		}
-		return MarshalArgs(results)
 	case "create_session":
 		LogAsync("INFO", "Executing create_session tool")
 		var args map[string]string
@@ -353,4 +383,22 @@ func (a *Agent) execTool(fc *FunctionCall, sessionID string) string {
 		LogAsync("ERROR", "Unknown tool: "+fname)
 		return "unknown tool: " + fname
 	}
+}
+
+// 拼写修复函数（示例）
+func fixQuerySpelling(q string) string {
+	fixes := map[string]string{
+		"gohtpserverswager": "go https server swagger",
+		"gorestapi":         "go rest api",
+	}
+	if corrected, ok := fixes[strings.ToLower(q)]; ok {
+		return corrected
+	}
+	return q // 无法识别时返回原值
+}
+
+// 基础验证函数
+func isValidQuery(q string) bool {
+	return len(q) >= 3 && 
+	       strings.ContainsAny(q, "abcdefghijklmnopqrstuvwxyz")
 }

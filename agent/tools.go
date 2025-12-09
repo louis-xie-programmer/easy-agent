@@ -157,7 +157,7 @@ func RunCodeSandbox(args RunCodeArgs) string {
 		}
 	}
 
-	timeout := 30                                // 增加默认超时时间
+	timeout := 3000                                // 增加默认超时时间
 	if args.Timeout > 0 && args.Timeout < 3000 { // 限制最大超时时间为300秒
 		timeout = args.Timeout
 	}

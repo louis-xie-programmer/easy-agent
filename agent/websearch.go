@@ -28,10 +28,10 @@ type SearchResult struct {
 func WebSearch(args WebSearchArgs) ([]SearchResult, error) {
 	LogAsync("INFO", "Executing web_search tool")
 	if args.NumResults <= 0 {
-		args.NumResults = 5
+		args.NumResults = 50
 	}
 	if args.Timeout <= 0 {
-		args.Timeout = 10
+		args.Timeout = 100
 	}
 
 	query := url.QueryEscape(args.Query)

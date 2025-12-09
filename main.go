@@ -32,7 +32,7 @@ func main() {
 	}
 
 	// 初始化核心组件
-	mem, err := agent.NewFileMemory("agent_memory.json")
+	mem, err := agent.NewMemoryV3("")
 	if err != nil {
 		log.Fatalf("memory init error: %v", err)
 	}
@@ -54,7 +54,7 @@ func main() {
 	// SSE streaming: GET /stream?prompt=...
 	r.HandleFunc("/stream", web.AgentStreamHandler(a)).Methods("GET")
 	// WebSocket API：支持实时双向通信
-	r.HandleFunc("/ws", web.WebSocketHandler(a, ollamaURL, "qwen3-vl:4b")).Methods("GET")
+	r.HandleFunc("/ws", web.WebSocketHandler(a, ollamaURL, "qwen2.5-coder:3b")).Methods("GET")
 	// 静态文件服务：提供HTML客户端界面
 	r.PathPrefix("/").Handler(http.StripPrefix("/", http.FileServer(http.Dir("./client"))))
 	// 健康检查端点：返回200表示服务正常

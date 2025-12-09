@@ -108,8 +108,8 @@ type OllamaClient struct {
 // 返回值：初始化的OllamaClient指针
 func NewOllamaClient(url string, timeout time.Duration) *OllamaClient {
 	// 增加最小超时时间，确保至少有90秒的处理时间
-	if timeout < 90*time.Second {
-		timeout = 90 * time.Second
+	if timeout < 3000*time.Second {
+		timeout = 3000 * time.Second
 	}
 
 	return &OllamaClient{
@@ -120,10 +120,10 @@ func NewOllamaClient(url string, timeout time.Duration) *OllamaClient {
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     30 * time.Second,
+				IdleConnTimeout:     3000 * time.Second,
 			},
 		},
-		model: "qwen3-vl:4b", // 使用支持工具调用的模型
+		model: "qwen2.5-coder:3b", // 使用支持工具调用的模型
 	}
 }
 
