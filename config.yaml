@@ -1,0 +1,21 @@
+server:
+  address: ":8080"
+
+ollama:
+  timeout_secs: 300
+  url: "http://localhost:11434/api/chat"
+  default_model: "qwen2.5-coder:3b"
+  models:
+    - "qwen2.5-coder:3b"
+    - "qwen3:4b"
+    - "deepseek-r1:1.5b"
+    - "llava"
+    - "qwen-vl-chat"
+    - "qwen3-vl:4b"
+
+log:
+  level: "INFO"
+
+storage:
+  memory_path: "./memory_store"
+  vector_path: "./memory_store"

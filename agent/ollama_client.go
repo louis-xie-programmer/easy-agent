@@ -7,276 +7,264 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Ollama-compatible request/response minimal types
-// ChatMessage 表示对话中的一条消息
-// 符合OpenAI API的消息格式规范
-// Role: 角色（system/user/assistant/tool）
-// Content: 消息内容文本
-// Name: 工具调用时的函数名称
-type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content,omitempty"`
-	Name    string `json:"name,omitempty"`
-}
 
-// ChatRequest 封装发送给Ollama模型的完整请求
-// Model: 使用的模型名称
-// Messages: 对话历史消息数组
-// Tools: 可用工具的元数据描述
-// ToolChoice: 工具选择策略（auto/manual/none）
-type ChatRequest struct {
-	Model      string        `json:"model"`
-	Messages   []ChatMessage `json:"messages"`
-	Tools      any           `json:"tools,omitempty"`
-	ToolChoice string        `json:"tool_choice,omitempty"`
-	Stream     bool          `json:"stream,omitempty"` // 添加流式支持
-}
-
-// FunctionCall 表示模型建议执行的函数调用
-// Name: 函数名称
-// Arguments: JSON格式的参数字符串
-// 该结构用于实现LLM的工具调用能力
-type FunctionCall struct {
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
-}
-
-// ChoiceMessage 表示模型返回的选择结果
-// 包含角色、内容以及可能的函数调用指令
-// 与ChatMessage类似但包含FunctionCall字段
-// 用于解析模型的响应
-// ChoiceMessage 结构体
-// 注意：这是Ollama API返回格式的一部分
-type ChoiceMessage struct {
-	Role         string        `json:"role"`
-	Content      string        `json:"content,omitempty"`
-	FunctionCall *FunctionCall `json:"function_call,omitempty"`
-	Name         string        `json:"name,omitempty"`
-	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"` // 添加对tool_calls的支持
+// ToolCallFunction 定义工具调用的具体函数信息
+type ToolCallFunction struct {
+	Name      string                 `json:"name"`      // 函数名称
+	Arguments map[string]interface{} `json:"arguments"` // 函数参数，JSON 对象格式
 }
 
 // ToolCall 表示模型建议执行的工具调用
-// Name: 工具名称
-// Arguments: 工具参数
+// 对应 Ollama/OpenAI API 的 tool_calls 列表项
 type ToolCall struct {
-	Name      string                 `json:"name"`
-	Arguments map[string]interface{} `json:"arguments"`
+	Type     string           `json:"type"`     // 工具类型，通常为 "function"
+	Function ToolCallFunction `json:"function"` // 工具函数的具体信息
+}
+
+// ChatMessage 表示对话中的一条消息
+// 符合OpenAI API的消息格式规范
+type ChatMessage struct {
+	Role      string     `json:"role"`                 // 角色（system/user/assistant/tool）
+	Content   string     `json:"content,omitempty"`    // 消息内容文本
+	Name      string     `json:"name,omitempty"`       // 工具调用时的函数名称
+	Images    []string   `json:"images,omitempty"`     // 图片数据（Base64编码），支持多模态
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"` // 助手消息中的工具调用列表
+}
+
+// ChatRequest 封装发送给Ollama模型的完整请求
+type ChatRequest struct {
+	Model      string        `json:"model"`                 // 使用的模型名称
+	Messages   []ChatMessage `json:"messages"`              // 对话历史消息数组
+	Tools      any           `json:"tools,omitempty"`       // 可用工具的元数据描述
+	ToolChoice string        `json:"tool_choice,omitempty"` // 工具选择策略（auto/manual/none）
+	Stream     bool          `json:"stream,omitempty"`      // 是否启用流式响应
+}
+
+// FunctionCall 表示模型建议执行的函数调用 (Legacy 兼容)
+type FunctionCall struct {
+	Name      string          `json:"name"`      // 函数名称
+	Arguments json.RawMessage `json:"arguments"` // JSON格式的参数字符串
+}
+
+// ChoiceMessage 表示模型返回的选择结果中的消息部分
+// 包含角色、内容以及可能的函数调用指令
+type ChoiceMessage struct {
+	Role         string        `json:"role"`                    // 角色
+	Content      string        `json:"content,omitempty"`       // 消息内容
+	FunctionCall *FunctionCall `json:"function_call,omitempty"` // 兼容旧版 FunctionCall
+	Name         string        `json:"name,omitempty"`          // 工具名称
+	ToolCalls    []ToolCall    `json:"tool_calls,omitempty"`    // 工具调用列表
 }
 
 // Choice 表示一个完整的响应选项
-// 包含一条Message
 // Ollama API可能返回多个选择，当前只处理第一个
 type Choice struct {
-	Message      ChoiceMessage `json:"message"`
-	FinishReason string        `json:"finish_reason,omitempty"`
+	Message      ChoiceMessage `json:"message"`                 // 消息内容
+	FinishReason string        `json:"finish_reason,omitempty"` // 结束原因
 }
 
 // ChatResponse 表示从Ollama接收到的完整响应
-// Choices: 响应选项数组（通常只有一个）
-// 该结构用于反序列化API返回的JSON数据
 type ChatResponse struct {
-	Choices []Choice `json:"choices"`
-	// Ollama may include other fields
+	Choices []Choice `json:"choices"` // 响应选项数组（通常只有一个）
+	// Ollama 可能包含其他字段
 }
 
 // OllamaClient 封装与Ollama服务的通信
-// url: API端点URL
-// client: HTTP客户端实例
-// model: 使用的模型名称
-// 提供统一的接口来调用大语言模型
 type OllamaClient struct {
-	url    string
-	client *http.Client
-	model  string
+	url    string       // Ollama API 端点 URL
+	client *http.Client // HTTP 客户端实例
+	model  string       // 默认使用的模型名称
+	cfg    Config       // 应用程序配置
 }
+
+// 确保 OllamaClient 实现了 LLMProvider 接口
+var _ LLMProvider = (*OllamaClient)(nil)
 
 // NewOllamaClient 创建新的Ollama客户端实例
-// 参数：
-//
-//	url: Ollama服务的API端点
-//	timeout: HTTP请求超时时间
-//
-// 默认使用支持工具调用的deepseek-r1模型
-// 返回值：初始化的OllamaClient指针
-func NewOllamaClient(url string, timeout time.Duration) *OllamaClient {
-	// 增加最小超时时间，确保至少有90秒的处理时间
-	if timeout < 3000*time.Second {
-		timeout = 3000 * time.Second
+// cfg: 应用程序配置
+func NewOllamaClient(cfg Config) *OllamaClient {
+	// 从配置中获取超时时间，如果无效则使用默认值
+	timeout := time.Duration(cfg.Ollama.TimeoutSecs) * time.Second
+	if timeout <= 0 {
+		timeout = 300 * time.Second // 默认 5 分钟
 	}
 
+	model := cfg.Ollama.DefaultModel // 从配置中获取默认模型
+
 	return &OllamaClient{
-		url: url,
+		url: cfg.Ollama.URL, // 从配置中获取 Ollama URL
 		client: &http.Client{
-			Timeout: timeout,
-			// 添加连接池配置
+			Timeout: timeout, // 设置 HTTP 请求超时
+			// 配置共享传输层，包含连接池
 			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
-				IdleConnTimeout:     3000 * time.Second,
+				MaxIdleConns:        100,              // 最大空闲连接数
+				MaxIdleConnsPerHost: 10,               // 每个主机的最大空闲连接数
+				IdleConnTimeout:     90 * time.Second, // 空闲连接超时时间
 			},
 		},
-		model: "qwen2.5-coder:3b", // 使用支持工具调用的模型
+		model: model, // 设置默认模型
+		cfg:   cfg,   // 存储配置
 	}
 }
 
-// Call 方法向Ollama服务发送聊天请求
-// 参数：
-//
-//	promptMessages: 对话历史消息
-//	tools: 工具元数据（可选）
-//
-// 返回值：API响应和错误信息
-// 实现完整的HTTP请求-响应流程，包括：
-// - 请求序列化
-// - HTTP头设置
-// - 响应处理
-// - 错误转换
-func (o *OllamaClient) Call(promptMessages []ChatMessage, tools any) (*ChatResponse, error) {
-	LogAsync("INFO", fmt.Sprintf("发起API调用，消息数量: %d", len(promptMessages)))
+// contextKey 是一个私有类型，用于防止 Context 键冲突
+type contextKey string
+
+const modelContextKey contextKey = "llm_model"
+
+// WithModel 返回一个新的 Context，其中包含指定的模型名称
+// 允许在运行时动态切换模型
+func WithModel(ctx context.Context, model string) context.Context {
+	return context.WithValue(ctx, modelContextKey, model)
+}
+
+// CallWithContext 是非流式调用的实现
+// ctx: 上下文，可包含追踪信息和动态模型选择
+// promptMessages: 对话消息历史
+// tools: 可用工具的元数据
+func (o *OllamaClient) CallWithContext(ctx context.Context, promptMessages []ChatMessage, tools any) (*ChatResponse, error) {
+	ctx, span := tracer.Start(ctx, "OllamaClient.CallWithContext",
+		trace.WithAttributes(
+			attribute.String("ollama.url", o.url),
+			attribute.Int("messages.count", len(promptMessages)),
+		),
+	)
+	defer span.End()
+
+	// 从 Context 中获取模型，如果存在则覆盖默认模型
+	model := o.model
+	if m, ok := ctx.Value(modelContextKey).(string); ok && m != "" {
+		model = m
+	}
+	span.SetAttributes(attribute.String("ollama.model", model))
+
+	Logger.Info().Str("model", model).Int("message_count", len(promptMessages)).Msg("Making API call")
 	reqBody := ChatRequest{
-		Model:      o.model,
+		Model:      model,
 		Messages:   promptMessages,
 		Tools:      tools,
 		ToolChoice: "auto",
-		Stream:     false, // 非流式调用
+		Stream:     false, // 明确设置为非流式
 	}
 
-	// 将请求体转换为JSON
+	// 序列化请求体
 	bs, err := json.Marshal(reqBody)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "request marshal failed")
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// 创建HTTP请求
-	req, err := http.NewRequest("POST", o.url, bytes.NewReader(bs))
+	// 创建 HTTP 请求
+	req, err := http.NewRequestWithContext(ctx, "POST", o.url, bytes.NewReader(bs))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "request creation failed")
 		return nil, err
 	}
-
-	// 设置请求头
 	req.Header.Set("Content-Type", "application/json")
-	// Ollama本地安装不需要API密钥
-	// 已移除认证头设置
-	// If Ollama requires any API key header, set it via env and uncomment:
-	// req.Header.Set("Authorization", "Bearer "+os.Getenv("OLLAMA_API_KEY"))
 
-	// 不要创建新的超时上下文，使用传入的上下文
-	// 如果没有上下文，则使用客户端默认超时
-	// 检查请求是否已经有上下文
-	/*if req.Context() == context.Background() {
-		// 只有在没有上下文时才应用默认超时
-		ctx, cancel := context.WithTimeout(context.Background(), o.client.Timeout)
-		defer cancel()
-		req = req.WithContext(ctx)
-	}*/
-
+	// 发送 HTTP 请求
 	resp, err := o.client.Do(req)
 	if err != nil {
-		LogAsync("ERROR", fmt.Sprintf("HTTP request to Ollama failed: %v", err))
+		Logger.Error().Err(err).Msg("HTTP request to Ollama failed")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "http request failed")
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// 检查HTTP状态码
+	// 处理非 2xx 状态码的响应
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("ollama error: %d %s", resp.StatusCode, string(body))
+		err = fmt.Errorf("ollama error: %d %s", resp.StatusCode, string(body))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "ollama returned error status")
+		return nil, err
 	}
 
-	// Ollama /api/chat 返回的是 application/x-ndjson 流式响应
-	// 需要逐行解析每个 JSON 对象
-	decoder := json.NewDecoder(resp.Body)
 	var finalResponse ChatResponse
+	// 反序列化响应体
+	if err := json.NewDecoder(resp.Body).Decode(&finalResponse); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "response decode failed")
+		return nil, fmt.Errorf("failed to decode ollama response: %w", err)
+	}
 
-	for {
-		var chunk map[string]interface{}
-		if err := decoder.Decode(&chunk); err == io.EOF {
-			break
-		} else if err != nil {
-			return nil, fmt.Errorf("failed to decode ollama response chunk: %w", err)
-		}
-
-		// 检查是否有错误信息
-		if errorMsg, ok := chunk["error"].(string); ok {
-			return nil, fmt.Errorf("ollama error: %s", errorMsg)
-		}
-
-		// 提取 content 并累加到最终响应
-		if message, ok := chunk["message"].(map[string]interface{}); ok {
-			if content, ok := message["content"].(string); ok && content != "" {
-				if len(finalResponse.Choices) == 0 {
-					finalResponse.Choices = append(finalResponse.Choices, Choice{
-						Message: ChoiceMessage{Role: "assistant", Content: ""},
-					})
-				}
-				finalResponse.Choices[0].Message.Content += content
-
-				// 检查是否包含工具调用（文本形式）
-				if toolCalls := o.extractToolCalls(content); len(toolCalls) > 0 {
-					finalResponse.Choices[0].Message.ToolCalls = toolCalls
-				}
-			}
-
-			// 检查是否是结束标记
-			if done, ok := chunk["done"].(bool); ok && done {
-				if finishReason, ok := chunk["finish_reason"].(string); ok {
-					if len(finalResponse.Choices) == 0 {
-						finalResponse.Choices = append(finalResponse.Choices, Choice{})
-					}
-					finalResponse.Choices[0].FinishReason = finishReason
-				}
-				break
+	// 后处理：处理不一致的工具调用格式
+	// 如果模型返回了内容但没有明确的 tool_calls 字段，尝试从内容中提取
+	if len(finalResponse.Choices) > 0 {
+		choice := &finalResponse.Choices[0]
+		if len(choice.Message.ToolCalls) == 0 && choice.Message.Content != "" {
+			if toolCalls := o.extractToolCalls(choice.Message.Content); len(toolCalls) > 0 {
+				choice.Message.ToolCalls = toolCalls
+				choice.Message.Content = "" // 如果提取到工具调用，则清空内容
 			}
 		}
 	}
 
-	if len(finalResponse.Choices) == 0 {
-		return nil, fmt.Errorf("empty response from ollama")
-	}
-
+	span.SetStatus(codes.Ok, "LLM call successful")
 	return &finalResponse, nil
 }
 
 // extractToolCalls 从文本内容中提取工具调用信息
+// 这是一个备用机制，用于处理 LLM 返回的工具调用格式不规范的情况
 func (o *OllamaClient) extractToolCalls(content string) []ToolCall {
-	// 查找类似 {"name": "...", "parameters": {...}} 的模式
-	// 这是deepseek-r1-tool-calling模型返回工具调用的方式
+	content = strings.TrimSpace(content)
 
-	// 简单的启发式方法：查找JSON对象
+	// 移除可能的 Markdown 代码块标记
+	if strings.HasPrefix(content, "```json") {
+		content = strings.TrimPrefix(content, "```json")
+		content = strings.TrimSuffix(content, "```")
+	} else if strings.HasPrefix(content, "```") {
+		content = strings.TrimPrefix(content, "```")
+		content = strings.TrimSuffix(content, "```")
+	}
+	content = strings.TrimSpace(content)
+
 	var toolCalls []ToolCall
 
-	// 查找第一个 '{' 和最后一个 '}'
 	start := strings.Index(content, "{")
 	end := strings.LastIndex(content, "}")
 
 	if start >= 0 && end > start {
 		jsonStr := content[start : end+1]
 
-		// 尝试解析为工具调用
 		var toolCallMap map[string]interface{}
 		if err := json.Unmarshal([]byte(jsonStr), &toolCallMap); err == nil {
 			if name, ok := toolCallMap["name"].(string); ok {
-				// 检查是否有parameters字段
 				if params, ok := toolCallMap["parameters"]; ok {
-					toolCall := ToolCall{
-						Name:      name,
-						Arguments: make(map[string]interface{}),
-					}
-
-					// 将parameters转换为map[string]interface{}
+					tc := ToolCall{Type: "function"}
+					tc.Function.Name = name
 					if paramsMap, ok := params.(map[string]interface{}); ok {
-						toolCall.Arguments = paramsMap
+						tc.Function.Arguments = paramsMap
 					}
-
-					toolCalls = append(toolCalls, toolCall)
+					toolCalls = append(toolCalls, tc)
+					return toolCalls
+				}
+				if args, ok := toolCallMap["arguments"]; ok {
+					tc := ToolCall{Type: "function"}
+					tc.Function.Name = name
+					if argsMap, ok := args.(map[string]interface{}); ok {
+						tc.Function.Arguments = argsMap
+					}
+					toolCalls = append(toolCalls, tc)
+					return toolCalls
 				}
 			}
 		}
@@ -285,78 +273,155 @@ func (o *OllamaClient) extractToolCalls(content string) []ToolCall {
 	return toolCalls
 }
 
-// StreamCall 实时流式处理Ollama响应
-// 直接将content流式写入writer，避免内容重组
-// 参数：
-//
-//	writer - 实现io.Writer接口的目标流（如WebSocket连接）
-func (o *OllamaClient) StreamCall(promptMessages []ChatMessage, tools any, writer io.Writer) error {
+// StreamCallWithContext 是流式调用的实现
+// ctx: 上下文
+// promptMessages: 对话消息历史
+// tools: 可用工具的元数据
+// writer: 用于写入流式响应的 io.Writer
+func (o *OllamaClient) StreamCallWithContext(ctx context.Context, promptMessages []ChatMessage, tools any, writer io.Writer) error {
+	ctx, span := tracer.Start(ctx, "OllamaClient.StreamCallWithContext",
+		trace.WithAttributes(
+			attribute.String("ollama.url", o.url),
+			attribute.Int("messages.count", len(promptMessages)),
+		),
+	)
+	defer span.End()
+
+	// 从 Context 中获取模型，如果存在则覆盖默认模型
+	model := o.model
+	if m, ok := ctx.Value(modelContextKey).(string); ok && m != "" {
+		model = m
+	}
+	span.SetAttributes(attribute.String("ollama.model", model))
+
 	reqBody := ChatRequest{
-		Model:      o.model,
+		Model:      model,
 		Messages:   promptMessages,
 		Tools:      tools,
 		ToolChoice: "auto",
-		Stream:     true, // 启用流式调用
+		Stream:     true, // 明确设置为流式
 	}
 
+	// 序列化请求体
 	bs, err := json.Marshal(reqBody)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "request marshal failed")
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", o.url, bytes.NewReader(bs))
+	// 创建 HTTP 请求
+	req, err := http.NewRequestWithContext(ctx, "POST", o.url, bytes.NewReader(bs))
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "request creation failed")
 		return err
 	}
-
 	req.Header.Set("Content-Type", "application/json")
 
-	// 不要创建新的超时上下文，使用传入的上下文
-	// 如果没有上下文，则使用客户端默认超时
-	// 检查请求是否已经有上下文
-	/*if req.Context() == context.Background() {
-		// 只有在没有上下文时才应用默认超时
-		ctx, cancel := context.WithTimeout(context.Background(), o.client.Timeout)
-		defer cancel()
-		req = req.WithContext(ctx)
-	}*/
-
+	// 发送 HTTP 请求
 	resp, err := o.client.Do(req)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "http request failed")
 		return err
 	}
 	defer resp.Body.Close()
 
+	// 处理非 2xx 状态码的响应
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("ollama error: %d %s", resp.StatusCode, string(body))
+		err = fmt.Errorf("ollama error: %d %s", resp.StatusCode, string(body))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "ollama returned error status")
+		return err
 	}
 
-	decoder := json.NewDecoder(resp.Body)
-	for {
-		var chunk map[string]interface{}
-		if err := decoder.Decode(&chunk); err == io.EOF {
-			break
-		} else if err != nil {
-			return fmt.Errorf("failed to decode ollama response chunk: %w", err)
-		}
-
-		if errorMsg, ok := chunk["error"].(string); ok {
-			return fmt.Errorf("ollama error: %s", errorMsg)
-		}
-
-		if message, ok := chunk["message"].(map[string]interface{}); ok {
-			if content, ok := message["content"].(string); ok && content != "" {
-				if _, err := writer.Write([]byte(content)); err != nil {
-					return err
-				}
-			}
-		}
-
-		// 检查是否是结束标记
-		if done, ok := chunk["done"].(bool); ok && done {
-			break
-		}
+	// 将响应体直接复制到 writer，实现流式传输
+	_, err = io.Copy(writer, resp.Body)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "stream copy failed")
+		return err
 	}
+
+	span.SetStatus(codes.Ok, "LLM stream call successful")
 	return nil
+}
+
+// Embed 获取文本的向量表示
+// ctx: 上下文
+// text: 需要生成嵌入的文本
+func (o *OllamaClient) Embed(ctx context.Context, text string) ([]float64, error) {
+	ctx, span := tracer.Start(ctx, "OllamaClient.Embed",
+		trace.WithAttributes(
+			attribute.String("ollama.url", o.url),
+			attribute.Int("text.length", len(text)),
+		),
+	)
+	defer span.End()
+
+	// 从配置中获取嵌入模型和 API 路径
+	embedModel := o.cfg.Embedding.Model
+	embedAPIPath := o.cfg.Embedding.APIPath
+
+	// 构建嵌入 API 的完整 URL
+	baseURL, err := url.Parse(o.url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse base ollama url: %w", err)
+	}
+	baseURL.Path = embedAPIPath
+	embedURL := baseURL.String()
+
+	reqBody := map[string]interface{}{
+		"model":  embedModel,
+		"prompt": text,
+	}
+
+	// 序列化请求体
+	bs, err := json.Marshal(reqBody)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "embed request marshal failed")
+		return nil, fmt.Errorf("failed to marshal embed request: %w", err)
+	}
+
+	// 创建 HTTP 请求
+	req, err := http.NewRequestWithContext(ctx, "POST", embedURL, bytes.NewReader(bs))
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "embed request creation failed")
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	// 发送 HTTP 请求
+	resp, err := o.client.Do(req)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "embed http request failed")
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// 处理非 2xx 状态码的响应
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		err = fmt.Errorf("ollama embed error: %d %s", resp.StatusCode, string(body))
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "ollama embed returned error status")
+		return nil, err
+	}
+
+	var result struct {
+		Embedding []float64 `json:"embedding"` // 嵌入向量
+	}
+	// 反序列化响应体
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "embed response decode failed")
+		return nil, err
+	}
+	span.SetStatus(codes.Ok, "Embedding successful")
+	return result.Embedding, nil
 }

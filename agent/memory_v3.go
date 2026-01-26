@@ -14,68 +14,73 @@ import (
 
 // ---------- 可配置常量 ----------
 const (
-	DefaultFlushInterval      = 5 * time.Second
-	DefaultBatchSize          = 50
-	DefaultSessionDirName     = "sessions"
-	DefaultMemoryFileName     = "memory.json"
-	DefaultSessionLoadLimit   = 200 // 启动时每个会话只加载最近 N 条消息到内存（节省内存）
-	DefaultWriteQueueCapacity = 1000
+	DefaultFlushInterval      = 5 * time.Second // 默认刷新间隔
+	DefaultBatchSize          = 50              // 默认批处理大小
+	DefaultSessionDirName     = "sessions"      // 默认会话目录名称
+	DefaultMemoryFileName     = "memory.json"   // 默认内存文件名
+	DefaultSessionLoadLimit   = 200             // 启动时每个会话只加载最近 N 条消息到内存（节省内存）
+	DefaultWriteQueueCapacity = 1000            // 默认写入队列容量
 )
 
 // ---------- 持久化数据结构：MemoryStore（可序列化） ----------
+// MemoryStorePersist 是用于持久化到 memory.json 的数据结构
 type MemoryStorePersist struct {
-	Conversations    []string                                  `json:"conversations"`
-	Notes            []string                                  `json:"notes"`
-	SessionsMeta     map[string]ConversationSessionMeta        `json:"sessions_meta"`
-	CurrentSessionID string                                    `json:"current_session_id"`
+	Conversations    []string                           `json:"conversations"`      // 对话列表
+	Notes            []string                           `json:"notes"`              // 笔记列表
+	SessionsMeta     map[string]ConversationSessionMeta `json:"sessions_meta"`      // 会话元数据映射
+	CurrentSessionID string                             `json:"current_session_id"` // 当前会话 ID
 }
 
+// ConversationSessionMeta 是会话的元数据结构
 type ConversationSessionMeta struct {
-	ID           string    `json:"id"`
-	Title        string    `json:"title"`
-	CreatedAt    time.Time `json:"created_at"`
-	LastActiveAt time.Time `json:"last_active_at"`
-	MessageCount int       `json:"message_count"`
+	ID           string    `json:"id"`             // 会话 ID
+	Title        string    `json:"title"`          // 会话标题
+	CreatedAt    time.Time `json:"created_at"`     // 创建时间
+	LastActiveAt time.Time `json:"last_active_at"` // 最后活动时间
+	MessageCount int       `json:"message_count"`  // 消息数量
 }
 
 // ---------- 运行时内存结构 ----------
+// MemoryV3 是运行时的内存结构
 type MemoryV3 struct {
-	// runtime protection
+	// 运行时保护
 	mu sync.RWMutex
 
-	// in-memory data
+	// 内存中的数据
 	conversations    []string
 	notes            []string
 	sessions         map[string]*ConversationSession
 	currentSessionID string
 
-	// persistence paths
+	// 持久化路径
 	baseDir    string
 	memoryPath string
 	sessionDir string
 
-	// writer queue and background goroutine
+	// 写入队列和后台 goroutine
 	writeQueue    chan func() error
 	flushInterval time.Duration
 	batchSize     int
 	durableSync   bool
+	wg            sync.WaitGroup // 用于等待后台写入完成
 
-	// flags
+	// 标志
 	dirty    int32
 	flushing int32
 
-	// startup config
+	// 启动配置
 	sessionLoadLimit int
 	closed           chan struct{}
 }
 
-// ConversationSession runtime struct (messages may be partial)
+// ConversationSession 是运行时的会话结构（消息可能是部分的）
 type ConversationSession struct {
-	Meta     ConversationSessionMeta `json:"meta"`
-	Messages []ChatMessage           `json:"messages"`
+	Meta     ConversationSessionMeta `json:"meta"`     // 会话元数据
+	Messages []ChatMessage           `json:"messages"` // 会话消息
 }
 
-// ---------- Constructor / Loader ----------
+// ---------- 构造函数 / 加载器 ----------
+// NewMemoryV3 创建一个新的 MemoryV3 实例
 func NewMemoryV3(baseDir string, opts ...MemoryV3Option) (*MemoryV3, error) {
 	if baseDir == "" {
 		baseDir = "./memory_store"
@@ -95,46 +100,56 @@ func NewMemoryV3(baseDir string, opts ...MemoryV3Option) (*MemoryV3, error) {
 		closed:           make(chan struct{}),
 	}
 
-	// apply options
+	// 应用选项
 	for _, o := range opts {
 		o(mem)
 	}
 
-	// ensure directories
+	// 确保目录存在
 	if err := os.MkdirAll(mem.sessionDir, 0o755); err != nil {
 		return nil, err
 	}
 
-	// load persisted state (non-fatal)
+	// 加载持久化状态（非致命）
 	if err := mem.loadFromDisk(); err != nil {
 		fmt.Printf("[MemoryV3] loadFromDisk warning: %v\n", err)
 	}
 
-	// start background writer
+	// 启动后台写入器
+	mem.wg.Add(1)
 	go mem.writerLoop()
 
 	return mem, nil
 }
 
-// ---------- Options ----------
+// ---------- 选项 ----------
+// MemoryV3Option 是 MemoryV3 的选项函数
 type MemoryV3Option func(*MemoryV3)
 
+// WithFlushInterval 设置刷新间隔
 func WithFlushInterval(d time.Duration) MemoryV3Option {
 	return func(m *MemoryV3) { m.flushInterval = d }
 }
+
+// WithBatchSize 设置批处理大小
 func WithBatchSize(sz int) MemoryV3Option {
 	return func(m *MemoryV3) { m.batchSize = sz }
 }
+
+// WithDurableSync 设置是否启用持久化同步
 func WithDurableSync(enabled bool) MemoryV3Option {
 	return func(m *MemoryV3) { m.durableSync = enabled }
 }
+
+// WithSessionLoadLimit 设置会话加载限制
 func WithSessionLoadLimit(limit int) MemoryV3Option {
 	return func(m *MemoryV3) { m.sessionLoadLimit = limit }
 }
 
-// ---------- Disk loading ----------
+// ---------- 从磁盘加载 ----------
+// loadFromDisk 从磁盘加载持久化状态
 func (m *MemoryV3) loadFromDisk() error {
-	// load memory.json if exists
+	// 如果存在，则加载 memory.json
 	if _, err := os.Stat(m.memoryPath); err == nil {
 		bs, err := os.ReadFile(m.memoryPath)
 		if err != nil {
@@ -144,7 +159,7 @@ func (m *MemoryV3) loadFromDisk() error {
 		if err := json.Unmarshal(bs, &store); err != nil {
 			return err
 		}
-		// load into runtime
+		// 加载到运行时
 		m.mu.Lock()
 		m.conversations = append([]string{}, store.Conversations...)
 		m.notes = append([]string{}, store.Notes...)
@@ -158,10 +173,10 @@ func (m *MemoryV3) loadFromDisk() error {
 		m.mu.Unlock()
 	}
 
-	// load session messages (jsonl) but limit how many we keep in memory per session
+	// 加载会话消息 (jsonl)，但限制每个会话在内存中保留的数量
 	fis, err := os.ReadDir(m.sessionDir)
 	if err != nil {
-		return nil // nothing to load
+		return nil // 无需加载
 	}
 	for _, fi := range fis {
 		if fi.IsDir() {
@@ -211,6 +226,7 @@ func (m *MemoryV3) loadFromDisk() error {
 	return nil
 }
 
+// ConversationSessionMetaToMeta 将 ConversationSessionMeta 转换为 ConversationSessionMeta
 func ConversationSessionMetaToMeta(meta ConversationSessionMeta) ConversationSessionMeta {
 	return ConversationSessionMeta{
 		ID:           meta.ID,
@@ -221,18 +237,22 @@ func ConversationSessionMetaToMeta(meta ConversationSessionMeta) ConversationSes
 	}
 }
 
-// ---------- Public API (threadsafe) ----------
+// ---------- 公共 API (线程安全) ----------
+// Close 关闭 MemoryV3 实例
 func (m *MemoryV3) Close() error {
-	// signal writerLoop to finish
+	// 通知 writerLoop 完成
 	close(m.closed)
-	// wait briefly then persist
-	time.Sleep(100 * time.Millisecond)
+	// 等待 writerLoop 完成
+	m.wg.Wait()
+
+	// 最终持久化
 	if err := m.persistStore(); err != nil {
 		return err
 	}
 	return nil
 }
 
+// AddConversation 添加对话
 func (m *MemoryV3) AddConversation(text string) {
 	m.enqueueWrite(func() error {
 		m.mu.Lock()
@@ -243,6 +263,7 @@ func (m *MemoryV3) AddConversation(text string) {
 	})
 }
 
+// AddNote 添加笔记
 func (m *MemoryV3) AddNote(text string) {
 	m.enqueueWrite(func() error {
 		m.mu.Lock()
@@ -253,6 +274,7 @@ func (m *MemoryV3) AddNote(text string) {
 	})
 }
 
+// CreateSession 创建会话
 func (m *MemoryV3) CreateSession(sessionID, title string) {
 	m.enqueueWrite(func() error {
 		m.mu.Lock()
@@ -274,6 +296,7 @@ func (m *MemoryV3) CreateSession(sessionID, title string) {
 	})
 }
 
+// SetCurrentSession 设置当前会话
 func (m *MemoryV3) SetCurrentSession(sessionID string) bool {
 	m.mu.RLock()
 	_, ok := m.sessions[sessionID]
@@ -294,6 +317,7 @@ func (m *MemoryV3) SetCurrentSession(sessionID string) bool {
 	return true
 }
 
+// AddMessageToSession 向会话添加消息
 func (m *MemoryV3) AddMessageToSession(sessionID string, msg ChatMessage) bool {
 	m.mu.RLock()
 	session, ok := m.sessions[sessionID]
@@ -308,12 +332,13 @@ func (m *MemoryV3) AddMessageToSession(sessionID string, msg ChatMessage) bool {
 		session.Meta.MessageCount++
 		m.mu.Unlock()
 
-		// persist one message line to sessions/<id>.jsonl
+		// 将一条消息行持久化到 sessions/<id>.jsonl
 		return m.appendSessionLine(sessionID, msg)
 	})
 	return true
 }
 
+// GetSessionMessages 获取会话消息
 func (m *MemoryV3) GetSessionMessages(sessionID string) ([]ChatMessage, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -326,12 +351,14 @@ func (m *MemoryV3) GetSessionMessages(sessionID string) ([]ChatMessage, bool) {
 	return out, true
 }
 
+// GetCurrentSessionID 获取当前会话 ID
 func (m *MemoryV3) GetCurrentSessionID() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.currentSessionID
 }
 
+// GetAllSessions 获取所有会话
 func (m *MemoryV3) GetAllSessions() map[string]map[string]interface{} {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -347,6 +374,7 @@ func (m *MemoryV3) GetAllSessions() map[string]map[string]interface{} {
 	return ret
 }
 
+// GetConversations 获取所有对话
 func (m *MemoryV3) GetConversations() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -354,6 +382,8 @@ func (m *MemoryV3) GetConversations() []string {
 	copy(out, m.conversations)
 	return out
 }
+
+// GetNotes 获取所有笔记
 func (m *MemoryV3) GetNotes() []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -362,20 +392,23 @@ func (m *MemoryV3) GetNotes() []string {
 	return out
 }
 
-// ---------- Persistence helpers ----------
+// ---------- 持久化帮助程序 ----------
 
+// enqueueWrite 将写入任务排入队列
 func (m *MemoryV3) enqueueWrite(task func() error) {
 	select {
 	case m.writeQueue <- task:
-		// queued
+		// 已排队
 	default:
-		// queue full: execute non-blocking fallback to avoid blocking caller
+		// 队列已满：执行非阻塞回退以避免阻塞调用者
 		go func() { _ = task() }()
 	}
 	atomic.StoreInt32(&m.dirty, 1)
 }
 
+// writerLoop 是后台写入循环
 func (m *MemoryV3) writerLoop() {
+	defer m.wg.Done()
 	ticker := time.NewTicker(m.flushInterval)
 	defer ticker.Stop()
 
@@ -384,7 +417,7 @@ func (m *MemoryV3) writerLoop() {
 	for {
 		select {
 		case <-m.closed:
-			// drain remaining tasks
+			// 耗尽剩余任务
 			for {
 				select {
 				case t := <-m.writeQueue:
@@ -403,7 +436,7 @@ func (m *MemoryV3) writerLoop() {
 			}
 
 		case <-ticker.C:
-			// drain up to batchSize
+			// 耗尽最多 batchSize 个任务
 			n := 0
 			for n < m.batchSize {
 				select {
@@ -432,6 +465,7 @@ func (m *MemoryV3) writerLoop() {
 	}
 }
 
+// runTasks 运行任务
 func (m *MemoryV3) runTasks(tasks []func() error) {
 	if len(tasks) == 0 {
 		return
@@ -457,8 +491,9 @@ func (m *MemoryV3) runTasks(tasks []func() error) {
 	}
 }
 
+// persistStore 持久化存储
 func (m *MemoryV3) persistStore() error {
-	// snapshot
+	// 快照
 	m.mu.RLock()
 	store := MemoryStorePersist{
 		Conversations:    append([]string{}, m.conversations...),
@@ -498,6 +533,7 @@ func (m *MemoryV3) persistStore() error {
 	return nil
 }
 
+// appendSessionLine 向会话文件追加一行
 func (m *MemoryV3) appendSessionLine(sessionID string, msg ChatMessage) error {
 	path := filepath.Join(m.sessionDir, sessionID)
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)

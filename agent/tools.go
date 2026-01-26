@@ -1,12 +1,12 @@
 // agent 包中的工具函数模块，包含：
-// - 代码沙箱执行
-// - 文件系统操作
-// - Git版本控制集成
-// 所有函数都被设计为安全的、受限的操作
+// - 所有内置工具的定义和实现 (WebSearchTool, RunCodeTool, etc.)
+// - 工具所需的底层执行逻辑 (RunCodeSandbox, ReadFile, etc.)
+// - 工具调用的验证逻辑 (isReasonableToolCall, etc.)
 package agent
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,162 +14,494 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
 )
 
-// Tool argument types
-// RunCodeArgs 定义运行代码工具的参数结构
-// Language: 编程语言（python/go）
-// Code: 要执行的源代码
-// Files: 额外需要创建的文件（如依赖文件）
-// Timeout: 执行超时时间（秒）
+// =================================================================================
+//
+//	Tool Argument Structs
+//
+// =================================================================================
 type RunCodeArgs struct {
-	Language string            `json:"language"`
-	Code     string            `json:"code"`
-	Files    map[string]string `json:"files,omitempty"`
-	Timeout  int               `json:"timeout,omitempty"` // seconds
+	Language string            `json:"language"`          // 编程语言 (e.g., 'python', 'go')
+	Code     string            `json:"code"`              // 要执行的源代码
+	Files    map[string]string `json:"files,omitempty"`   // 需要写入沙箱的额外文件
+	Timeout  int               `json:"timeout,omitempty"` // 执行超时时间（秒）
 }
 
-// ReadFileArgs 定义读取文件工具的参数结构
-// Path: 要读取的文件路径
-// ChunkSize: 分块大小（字节），0表示不分块
-// Offset: 读取偏移量（字节）
 type ReadFileArgs struct {
-	Path      string `json:"path"`
-	ChunkSize int    `json:"chunk_size,omitempty"`
-	Offset    int64  `json:"offset,omitempty"`
+	Path      string `json:"path"`                 // 文件路径
+	ChunkSize int    `json:"chunk_size,omitempty"` // 读取块大小
+	Offset    int64  `json:"offset,omitempty"`     // 读取偏移量
 }
 
-// WriteFileArgs 定义写入文件工具的参数结构
-// Path: 目标文件路径
-// Content: 要写入的内容
-// Mode: 写入模式（overwrite/append）
 type WriteFileArgs struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
-	Mode    string `json:"mode,omitempty"`
+	Path    string `json:"path"`           // 文件路径
+	Content string `json:"content"`        // 要写入的内容
+	Mode    string `json:"mode,omitempty"` // 写入模式 ('overwrite' or 'append')
 }
 
-// GitCmdArgs 定义Git命令工具的参数结构
-// Workdir: 工作目录
-// Cmd: 要执行的Git命令数组（如["status"]）
 type GitCmdArgs struct {
-	Workdir string   `json:"workdir"`
-	Cmd     []string `json:"cmd"`
+	Workdir string   `json:"workdir"` // git 命令的工作目录
+	Cmd     []string `json:"cmd"`     // git 命令及其参数
 }
 
-// 添加工作区清理机制
+// =================================================================================
+//
+//	Tool Validation Logic (Final Version)
+//
+// =================================================================================
+
+// isSimpleGreeting 检查提示是否为常见的简短问候语
+func isSimpleGreeting(prompt string) bool {
+	prompt = strings.ToLower(strings.TrimSpace(prompt))
+	if len(prompt) > 30 { // 问候语通常很短
+		return false
+	}
+	greetings := []string{"hello", "hi", "hey", "你好", "您好", "你好啊", "在吗"}
+	for _, g := range greetings {
+		if prompt == g {
+			return true
+		}
+	}
+	return false
+}
+
+// isReasonableToolCall 应用一组硬编码规则来防止明显的工具幻觉
+// 这是工具调用验证的唯一真实来源
+func (a *Agent) isReasonableToolCall(originalPrompt string, toolCall ToolCall) bool {
+	// 规则 1：对于简单的问候语，从不使用任何工具
+	if isSimpleGreeting(originalPrompt) {
+		Logger.Warn().Str("tool_name", toolCall.Function.Name).Str("prompt", originalPrompt).Msg("Tool call rejected by simple greeting rule.")
+		return false
+	}
+
+	// 规则 2：工具必须与配置中提示的关键词相关
+	prompt := strings.ToLower(originalPrompt)
+	toolName := toolCall.Function.Name
+
+	requiredKeywords, ok := a.config.ToolValidation.Keywords[toolName]
+	if !ok {
+		// 如果工具不在配置中，我们可以严格拒绝它
+		Logger.Warn().Str("tool_name", toolName).Msg("Tool call rejected because the tool itself is not in the validation config.")
+		return false
+	}
+
+	for _, kw := range requiredKeywords {
+		if strings.Contains(prompt, kw) {
+			return true // 找到相关关键词，因此调用可能是合理的
+		}
+	}
+
+	// 如果未找到相关关键词，则工具调用不合理
+	Logger.Warn().Str("tool_name", toolName).Str("prompt", originalPrompt).Msg("Tool call rejected by keyword validation.")
+	return false
+}
+
+// isValidQuery 对搜索查询进行基本验证
+func isValidQuery(q string) bool {
+	return len(q) >= 2 &&
+		strings.ContainsAny(q, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+}
+
+// =================================================================================
+//
+//	Tool Implementations
+//
+// =================================================================================
+
+type WebSearchTool struct{}
+
+func (t *WebSearchTool) Name() string { return "web_search" }
+func (t *WebSearchTool) Description() string {
+	return "When you need to get real-time information, statistics, or search the web, use this tool. For example: CEO names, population statistics, latest news, etc."
+}
+func (t *WebSearchTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query":       map[string]any{"type": "string", "description": "The search query."},
+			"num_results": map[string]any{"type": "integer", "description": "Number of results to return."},
+			"fetch_pages": map[string]any{"type": "boolean", "description": "Whether to fetch the full content of result pages."},
+		},
+		"required": []string{"query"},
+	}
+}
+func (t *WebSearchTool) IsSensitive() bool { return false }
+func (t *WebSearchTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ io.Writer) (string, error) {
+	_, span := tracer.Start(ctx, "Tool.WebSearch")
+	defer span.End()
+
+	var args WebSearchArgs
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+	span.SetAttributes(attribute.String("query", args.Query))
+
+	if !isValidQuery(args.Query) {
+		return "Error: The search query is too short or invalid.", nil
+	}
+	results, err := WebSearch(args)
+	if err != nil {
+		return "", err
+	}
+	return MarshalArgs(results), nil
+}
+
+type RunCodeTool struct{}
+
+func (t *RunCodeTool) Name() string { return "run_code" }
+func (t *RunCodeTool) Description() string {
+	return "Executes code in a sandboxed environment. Use this ONLY when the user explicitly asks to run or execute a piece of code."
+}
+func (t *RunCodeTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"language": map[string]any{"type": "string", "description": "The programming language (e.g., 'python', 'go')."},
+			"code":     map[string]any{"type": "string", "description": "The source code to execute."},
+			"timeout":  map[string]any{"type": "integer", "description": "Execution timeout in seconds."},
+		},
+		"required": []string{"language", "code"},
+	}
+}
+func (t *RunCodeTool) IsSensitive() bool { return true }
+func (t *RunCodeTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, stream io.Writer) (string, error) {
+	_, span := tracer.Start(ctx, "Tool.RunCode")
+	defer span.End()
+
+	var args RunCodeArgs
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+	span.SetAttributes(attribute.String("language", args.Language))
+
+	return a.RunCodeSandbox(args, stream)
+}
+
+type ReadFileTool struct{}
+
+func (t *ReadFileTool) Name() string { return "read_file" }
+func (t *ReadFileTool) Description() string {
+	return "Reads the content of a file. Use this when the user asks to see, open, or read a specific file."
+}
+func (t *ReadFileTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path": map[string]any{"type": "string", "description": "The path to the file."},
+		},
+		"required": []string{"path"},
+	}
+}
+func (t *ReadFileTool) IsSensitive() bool { return false }
+func (t *ReadFileTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ io.Writer) (string, error) {
+	_, span := tracer.Start(ctx, "Tool.ReadFile")
+	defer span.End()
+
+	var args ReadFileArgs
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+	span.SetAttributes(attribute.String("path", args.Path))
+
+	return ReadFile(args), nil
+}
+
+type WriteFileTool struct{}
+
+func (t *WriteFileTool) Name() string { return "write_file" }
+func (t *WriteFileTool) Description() string {
+	return "Writes content to a file. Use this ONLY when the user explicitly asks to save, write, or create a file."
+}
+func (t *WriteFileTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path":    map[string]any{"type": "string", "description": "The path to the file."},
+			"content": map[string]any{"type": "string", "description": "The content to write."},
+			"mode":    map[string]any{"type": "string", "description": "Write mode: 'overwrite' or 'append'."},
+		},
+		"required": []string{"path", "content"},
+	}
+}
+func (t *WriteFileTool) IsSensitive() bool { return true }
+func (t *WriteFileTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ io.Writer) (string, error) {
+	_, span := tracer.Start(ctx, "Tool.WriteFile")
+	defer span.End()
+
+	var args WriteFileArgs
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+	span.SetAttributes(attribute.String("path", args.Path), attribute.String("mode", args.Mode))
+
+	return WriteFile(args), nil
+}
+
+type GitCmdTool struct{}
+
+func (t *GitCmdTool) Name() string { return "git_cmd" }
+func (t *GitCmdTool) Description() string {
+	return "Executes a git command in the working directory. Only safe, read-only commands are allowed."
+}
+func (t *GitCmdTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"workdir": map[string]any{"type": "string", "description": "The working directory for the git command."},
+			"cmd":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+		},
+		"required": []string{"workdir", "cmd"},
+	}
+}
+func (t *GitCmdTool) IsSensitive() bool { return false }
+func (t *GitCmdTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ io.Writer) (string, error) {
+	_, span := tracer.Start(ctx, "Tool.GitCmd")
+	defer span.End()
+
+	var args GitCmdArgs
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+	span.SetAttributes(attribute.String("workdir", args.Workdir), attribute.StringSlice("cmd", args.Cmd))
+
+	return GitCmd(args), nil
+}
+
+type CreateSessionTool struct{}
+
+func (t *CreateSessionTool) Name() string { return "create_session" }
+func (t *CreateSessionTool) Description() string {
+	return "Creates a new conversation session. Use this ONLY when the user explicitly asks to create or start a new session/topic."
+}
+func (t *CreateSessionTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"title": map[string]any{"type": "string", "description": "The title for the new session."},
+		},
+		"required": []string{"title"},
+	}
+}
+func (t *CreateSessionTool) IsSensitive() bool { return false }
+func (t *CreateSessionTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, _ io.Writer) (string, error) {
+	_, span := tracer.Start(ctx, "Tool.CreateSession")
+	defer span.End()
+
+	var args map[string]string
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+	title := args["title"]
+	span.SetAttributes(attribute.String("title", title))
+
+	newSessionID := uuid.New().String()
+	a.mem.CreateSession(newSessionID, title)
+	return fmt.Sprintf("New session created: %s (ID: %s)", title, newSessionID), nil
+}
+
+type SwitchSessionTool struct{}
+
+func (t *SwitchSessionTool) Name() string { return "switch_session" }
+func (t *SwitchSessionTool) Description() string {
+	return "Switches to a different conversation session. Use this ONLY when the user explicitly asks to switch, change, or load a different session."
+}
+func (t *SwitchSessionTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"session_id": map[string]any{"type": "string", "description": "The ID of the session to switch to."},
+		},
+		"required": []string{"session_id"},
+	}
+}
+func (t *SwitchSessionTool) IsSensitive() bool { return false }
+func (t *SwitchSessionTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, _ io.Writer) (string, error) {
+	_, span := tracer.Start(ctx, "Tool.SwitchSession")
+	defer span.End()
+
+	var args map[string]string
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+	targetID := args["session_id"]
+	span.SetAttributes(attribute.String("target_session_id", targetID))
+
+	if a.mem.SetCurrentSession(targetID) {
+		msgs, _ := a.mem.GetSessionMessages(targetID)
+		return fmt.Sprintf("Switched to session ID: %s, which contains %d messages.", targetID, len(msgs)), nil
+	}
+	return fmt.Sprintf("Could not switch to session ID: %s. Session not found.", targetID), nil
+}
+
+type KnowledgeSearchTool struct{}
+
+func (t *KnowledgeSearchTool) Name() string { return "knowledge_search" }
+func (t *KnowledgeSearchTool) Description() string {
+	return "Searches the local knowledge base. Use this when the user asks about project documentation, history, or specific domain knowledge."
+}
+func (t *KnowledgeSearchTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query": map[string]any{"type": "string", "description": "The query to search for in the knowledge base."},
+			"top_k": map[string]any{"type": "integer", "description": "The number of top results to return."},
+		},
+		"required": []string{"query"},
+	}
+}
+func (t *KnowledgeSearchTool) IsSensitive() bool { return false }
+func (t *KnowledgeSearchTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, _ io.Writer) (string, error) {
+	_, span := tracer.Start(ctx, "Tool.KnowledgeSearch")
+	defer span.End()
+
+	var args struct {
+		Query string `json:"query"`
+		TopK  int    `json:"top_k"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+	if args.TopK <= 0 {
+		args.TopK = 3
+	}
+	span.SetAttributes(attribute.String("query", args.Query), attribute.Int("top_k", args.TopK))
+
+	queryVec, err := a.llm.Embed(ctx, args.Query)
+	if err != nil {
+		return "", fmt.Errorf("embed error: %v", err)
+	}
+
+	results, err := a.vectorStore.Search(queryVec, args.TopK)
+	if err != nil {
+		return "", fmt.Errorf("vector search error: %v", err)
+	}
+	if len(results) == 0 {
+		return "No relevant knowledge found.", nil
+	}
+
+	var sb strings.Builder
+	for i, res := range results {
+		sb.WriteString(fmt.Sprintf("[%d] (Similarity: %.2f)\n%s\n\n", i+1, res.Score, res.Doc.Content))
+	}
+	return sb.String(), nil
+}
+
+// =================================================================================
+//
+//	Underlying Tool Logic
+//
+// =================================================================================
+
 var (
 	cleanupMu    sync.Mutex
 	workDirs     = make(map[string]time.Time)
 	cleanupTimer *time.Timer
 )
 
-// 初始化清理定时器
 func init() {
+	// 这个 init 函数在 main 之前运行
+	// 我们不能在这里访问 Agent.config，所以 cleanupTimer 需要不同的管理方式
+	// 或者确保 ensureSandboxInitialized 稍后被调用
+	// 现在，我们保持简单，并假设 cleanupWorkDirs 会被定期调用
 	cleanupTimer = time.AfterFunc(1*time.Hour, cleanupWorkDirs)
 }
 
-// 清理过期的工作目录
+func (a *Agent) ensureSandboxInitialized() {
+	a.sandboxOnce.Do(func() {
+		// 检查 docker 是否正在运行
+		cmd := exec.Command("docker", "info")
+		if err := cmd.Run(); err != nil {
+			Logger.Error().Err(err).Msg("Docker is not running or not installed. Code execution will fail.")
+		}
+
+		maxConcurrency := a.config.Sandbox.MaxConcurrency
+		if maxConcurrency <= 0 {
+			maxConcurrency = 5
+		}
+		a.runCodeSandboxSemaphore = make(chan struct{}, maxConcurrency)
+	})
+}
+
 func cleanupWorkDirs() {
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
-
 	now := time.Now()
 	for workDir, createTime := range workDirs {
-		// 清理超过1小时的临时目录
 		if now.Sub(createTime) > 1*time.Hour {
 			os.RemoveAll(workDir)
 			delete(workDirs, workDir)
 		}
 	}
-
-	// 重新调度下次清理
 	cleanupTimer.Reset(1 * time.Hour)
 }
 
-// runCodeSandboxPool 控制并发执行的数量
-var runCodeSandboxSemaphore = make(chan struct{}, 5) // 最多同时运行5个沙箱
+func (a *Agent) RunCodeSandbox(args RunCodeArgs, stream io.Writer) (string, error) {
+	// 在执行开始时添加检查
+	cmdCheck := exec.Command("docker", "info")
+	if err := cmdCheck.Run(); err != nil {
+		errMsg := "Docker is not running or accessible. Please start Docker Desktop and try again."
+		Logger.Error().Err(err).Msg(errMsg)
+		return errMsg, fmt.Errorf(errMsg)
+	}
 
-// RunCodeSandbox 在Docker沙箱中安全执行代码
-// 特性：
-//   - 使用临时工作目录
-//   - 支持Python和Go语言
-//   - 严格的资源限制（CPU/内存/网络）
-//   - 自动清理机制
-//
-// 返回值：执行输出或错误信息
-func RunCodeSandbox(args RunCodeArgs) string {
-	// 控制并发执行数量
-	runCodeSandboxSemaphore <- struct{}{}
-	defer func() { <-runCodeSandboxSemaphore }()
+	a.ensureSandboxInitialized()
+	a.runCodeSandboxSemaphore <- struct{}{}
+	defer func() { <-a.runCodeSandboxSemaphore }()
 
-	// 创建唯一的临时工作空间
-	// 命名格式：agent_work_时间戳
-	// 存储在./sandboxes目录下
-	// workspace
 	tmp := fmt.Sprintf("agent_work_%d", time.Now().UnixNano())
 	base := filepath.Join("./sandboxes", tmp)
 	if err := os.MkdirAll(base, 0755); err != nil {
-		return fmt.Sprintf("mkdir error: %v", err)
+		return "", fmt.Errorf("mkdir error: %v", err)
 	}
 
-	// 注册工作目录以备清理
 	cleanupMu.Lock()
 	workDirs[base] = time.Now()
 	cleanupMu.Unlock()
 
-	// 根据语言类型写入主文件
-	// Python: main.py
-	// Go: main.go + go.mod
-	// 其他: main.txt
-	// 同时写入额外指定的文件
-	// write files
 	mainFile := ""
 	switch args.Language {
 	case "python":
 		mainFile = "main.py"
 		if err := os.WriteFile(filepath.Join(base, mainFile), []byte(args.Code), 0644); err != nil {
-			return fmt.Sprintf("write file error: %v", err)
+			return "", fmt.Errorf("write file error: %v", err)
 		}
 	case "go":
-		if err := os.WriteFile(filepath.Join(base, "main.go"), []byte(args.Code), 0644); err != nil {
-			return fmt.Sprintf("write file error: %v", err)
+		mainFile = "main.go"
+		if err := os.WriteFile(filepath.Join(base, mainFile), []byte(args.Code), 0644); err != nil {
+			return "", fmt.Errorf("write file error: %v", err)
 		}
-		// for go module, quick hack: create go.mod
 		if err := os.WriteFile(filepath.Join(base, "go.mod"), []byte("module sandbox\n\ngo 1.20\n"), 0644); err != nil {
-			return fmt.Sprintf("write go.mod error: %v", err)
+			return "", fmt.Errorf("write go.mod error: %v", err)
 		}
 	default:
-		if err := os.WriteFile(filepath.Join(base, "main.txt"), []byte(args.Code), 0644); err != nil {
-			return fmt.Sprintf("write file error: %v", err)
+		mainFile = "main.txt"
+		if err := os.WriteFile(filepath.Join(base, mainFile), []byte(args.Code), 0644); err != nil {
+			return "", fmt.Errorf("write file error: %v", err)
 		}
 	}
 
 	for p, content := range args.Files {
 		full := filepath.Join(base, p)
 		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
-			return fmt.Sprintf("mkdir error: %v", err)
+			return "", fmt.Errorf("mkdir error: %v", err)
 		}
 		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
-			return fmt.Sprintf("write file error: %v", err)
+			return "", fmt.Errorf("write file error: %v", err)
 		}
 	}
 
-	timeout := 3000                                // 增加默认超时时间
-	if args.Timeout > 0 && args.Timeout < 3000 { // 限制最大超时时间为300秒
+	timeout := a.config.Sandbox.DefaultTimeout
+	if args.Timeout > 0 && args.Timeout < a.config.Sandbox.MaxTimeout {
 		timeout = args.Timeout
 	}
 
-	// 根据编程语言选择合适的Docker镜像
-	// 设置执行超时（默认8秒）
-	// 构建docker run命令参数
-	// --network none: 禁用网络访问
-	// --pids-limit 64: 限制进程数
-	// --memory 256m: 内存限制
-	// --cpus 0.5: CPU限制
-	// choose appropriate image
 	image := "python:3.11"
 	cmdSh := ""
 	switch args.Language {
@@ -178,7 +510,7 @@ func RunCodeSandbox(args RunCodeArgs) string {
 	case "go":
 		cmdSh = fmt.Sprintf("timeout %d go run .", timeout)
 	default:
-		cmdSh = fmt.Sprintf("timeout %d cat %s", timeout, "main.txt")
+		cmdSh = fmt.Sprintf("timeout %d cat %s", timeout, mainFile)
 		image = "alpine:3.18"
 	}
 
@@ -188,24 +520,26 @@ func RunCodeSandbox(args RunCodeArgs) string {
 		"-w", "/work",
 		"--network", "none",
 		"--pids-limit", "64",
-		"--memory", "256m",
-		"--cpus", "0.5",
+		"--memory", fmt.Sprintf("%dm", a.config.Sandbox.MemoryMB),
+		"--cpus", fmt.Sprintf("%.2f", a.config.Sandbox.CpuQuota),
 		image,
 		"sh", "-lc", cmdSh,
 	}
 
-	// 创建带超时的上下文，比代码执行超时多3秒用于清理
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout+3)*time.Second)
 	defer cancel()
 
-	// 执行Docker命令并捕获输出
-	// 使用CombinedOutput同时获取stdout和stderr
 	cmd := exec.CommandContext(ctx, "docker", dockerArgs...)
-	out, err := cmd.CombinedOutput()
 
-	// 异步清理工作目录（不要阻塞当前操作）
+	var combinedOutput bytes.Buffer
+	multiWriter := io.MultiWriter(&combinedOutput, stream)
+	cmd.Stdout = multiWriter
+	cmd.Stderr = multiWriter
+
+	err := cmd.Run()
+
 	go func() {
-		time.Sleep(1 * time.Minute) // 等待1分钟后清理
+		time.Sleep(1 * time.Minute)
 		os.RemoveAll(base)
 		cleanupMu.Lock()
 		delete(workDirs, base)
@@ -213,20 +547,12 @@ func RunCodeSandbox(args RunCodeArgs) string {
 	}()
 
 	if err != nil {
-		return fmt.Sprintf("error: %v\noutput:\n%s", err, string(out))
+		return combinedOutput.String(), fmt.Errorf("error: %v\noutput:\n%s", err, combinedOutput.String())
 	}
-	return string(out)
+	return combinedOutput.String(), nil
 }
 
-// ReadFile 安全读取文件内容
-// 特性：
-//   - 支持分块读取大文件
-//   - 缓冲I/O优化
-//   - 错误处理与完整性检查
-//
-// 返回值：文件内容或错误信息
 func ReadFile(args ReadFileArgs) string {
-	// 检查文件是否存在且是常规文件
 	info, err := os.Stat(args.Path)
 	if err != nil {
 		return "read error: " + err.Error()
@@ -234,8 +560,6 @@ func ReadFile(args ReadFileArgs) string {
 	if info.IsDir() {
 		return "read error: path is a directory"
 	}
-
-	// 限制文件大小（10MB以内）
 	if info.Size() > 10*1024*1024 {
 		return "read error: file too large (max 10MB)"
 	}
@@ -246,19 +570,16 @@ func ReadFile(args ReadFileArgs) string {
 	}
 	defer file.Close()
 
-	// 设置缓冲区提高I/O性能
-	reader := bufio.NewReaderSize(file, 64*1024) // 64KB buffer
+	reader := bufio.NewReaderSize(file, 64*1024)
 
-	// 处理偏移量
 	if args.Offset > 0 {
 		if _, err := file.Seek(args.Offset, 0); err != nil {
 			return "seek error: " + err.Error()
 		}
 	}
 
-	// 分块读取模式
 	if args.ChunkSize > 0 {
-		if args.ChunkSize > 10*1024*1024 { // 限制块大小
+		if args.ChunkSize > 10*1024*1024 {
 			args.ChunkSize = 10 * 1024 * 1024
 		}
 		buffer := make([]byte, args.ChunkSize)
@@ -272,7 +593,6 @@ func ReadFile(args ReadFileArgs) string {
 		return ""
 	}
 
-	// 全量读取模式（保持向后兼容）
 	content, err := io.ReadAll(reader)
 	if err != nil {
 		return "read all error: " + err.Error()
@@ -280,31 +600,19 @@ func ReadFile(args ReadFileArgs) string {
 	return string(content)
 }
 
-// WriteFile 安全写入文件
-// 支持两种模式：
-//   - overwrite: 覆盖写入（默认）
-//   - append: 追加写入
-//
-// 返回值：操作结果描述
 func WriteFile(args WriteFileArgs) string {
 	mode := args.Mode
 	if mode == "" {
 		mode = "overwrite"
 	}
-
-	// 检查文件路径安全性
 	if filepath.IsAbs(args.Path) {
 		return "write error: absolute path not allowed"
 	}
-
-	// 限制文件大小（10MB以内）
 	if len(args.Content) > 10*1024*1024 {
 		return "write error: content too large (max 10MB)"
 	}
 
-	// 覆盖模式：直接写入新内容
 	if mode == "overwrite" {
-		// 确保目录存在
 		if err := os.MkdirAll(filepath.Dir(args.Path), 0755); err != nil {
 			return "write error: " + err.Error()
 		}
@@ -314,9 +622,6 @@ func WriteFile(args WriteFileArgs) string {
 		return "written"
 	}
 
-	// 追加模式：打开文件并在末尾添加内容
-	// 使用O_APPEND标志确保原子性操作
-	// append
 	f, err := os.OpenFile(args.Path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {
 		return "append error: " + err.Error()
@@ -328,53 +633,26 @@ func WriteFile(args WriteFileArgs) string {
 	return "appended"
 }
 
-// GitCmd 执行安全的Git命令
-// 特性：
-//   - 工作目录验证
-//   - 命令执行与输出捕获
-//   - 错误处理
-//
-// 返回值：Git命令输出或错误信息
 func GitCmd(args GitCmdArgs) string {
-	// basic safety: require local path exists
 	if args.Workdir == "" {
 		return "git error: workdir empty"
 	}
-
-	// 检查工作目录是否存在
 	if _, err := os.Stat(args.Workdir); os.IsNotExist(err) {
 		return "git error: workdir not exists"
 	}
-
-	// 限制命令长度
 	if len(args.Cmd) == 0 {
 		return "git error: cmd empty"
 	}
 
-	// 只允许安全的Git命令
 	allowedCommands := map[string]bool{
-		"status":    true,
-		"log":       true,
-		"diff":      true,
-		"show":      true,
-		"blame":     true,
-		"rev-parse": true,
-		"branch":    true,
-		"tag":       true,
-		"remote":    true,
-		"config":    true,
-		"ls-files":  true,
+		"status": true, "log": true, "diff": true, "show": true, "blame": true,
+		"rev-parse": true, "branch": true, "tag": true, "remote": true,
+		"config": true, "ls-files": true,
 	}
-
 	if !allowedCommands[args.Cmd[0]] {
 		return fmt.Sprintf("git error: command '%s' not allowed", args.Cmd[0])
 	}
 
-	// 创建Git命令执行实例
-	// 设置工作目录
-	// 捕获组合输出（stdout+stderr）
-
-	// 设置超时
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -388,9 +666,7 @@ func GitCmd(args GitCmdArgs) string {
 	return string(out)
 }
 
-// helper to pretty marshal args
 func MarshalArgs(v any) string {
-	LogAsync("DEBUG", fmt.Sprintf("Marshaling args: %+v", v))
 	b, _ := json.MarshalIndent(v, "", "  ")
 	return string(b)
 }
