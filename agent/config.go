@@ -8,6 +8,13 @@ import (
 	"github.com/spf13/viper"
 )
 
+// AgentConfig 定义了单个 Agent 的特定配置
+type AgentConfig struct {
+	Role         string   `mapstructure:"role"`          // Agent 的角色 (e.g., "foreman", "coder", "researcher")
+	AllowedTools []string `mapstructure:"allowed_tools"` // 该 Agent 允许使用的工具列表
+	SystemPrompt string   `mapstructure:"system_prompt"` // 该 Agent 的系统提示词 (可选)
+}
+
 // Config 定义了应用程序的所有配置结构
 // 使用 mapstructure 标签将配置文件中的键映射到结构体字段
 type Config struct {
@@ -38,7 +45,8 @@ type Config struct {
 	} `mapstructure:"storage"`
 	// Agent 代理核心配置
 	Agent struct {
-		MaxIterations int `mapstructure:"max_iterations"` // 最大思考/执行循环次数
+		MaxIterations int                    `mapstructure:"max_iterations"` // 最大思考/执行循环次数
+		Agents        map[string]AgentConfig `mapstructure:"agents"`         // 多 Agent 配置，key 为 Agent 名称
 	} `mapstructure:"agent"`
 	// Embedding 向量嵌入配置
 	Embedding struct {

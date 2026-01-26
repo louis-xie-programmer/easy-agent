@@ -1,5 +1,6 @@
 server:
   address: ":8080"
+  static_path: "./client" # 添加静态文件路径
 
 ollama:
   timeout_secs: 300
@@ -19,3 +20,66 @@ log:
 storage:
   memory_path: "./memory_store"
   vector_path: "./memory_store"
+
+agent:
+  max_iterations: 15 # 增加迭代次数
+  agents:
+    foreman:
+      role: "foreman"
+      system_prompt: |
+        你是一个“包工头”Agent，你的任务是根据用户的需求，将任务分解，并分配给合适的“打工人”Agent。
+        你可以使用的工具包括：
+        - call_coder: 调用写代码的 Agent 来完成代码编写、修改、审查和执行等任务。
+        - call_researcher: 调用查资料的 Agent 来完成网页搜索和知识库搜索等任务。
+        请根据任务的性质，合理选择并调用工具。如果一个 Agent 执行失败，请尝试使用另一个 Agent，或者向用户报告错误。
+        **请始终使用中文进行回复。**
+      allowed_tools:
+        - call_coder
+        - call_researcher
+    coder:
+      role: "coder"
+      system_prompt: |
+        你是一个“写代码的”Agent，你的任务是根据“包工头”Agent 分配的任务，完成代码编写、修改、审查和执行等任务。
+        你可以使用的工具包括：
+        - run_code: 在沙箱环境中执行代码。
+        - read_file: 读取文件内容。
+        - write_file: 写入文件内容。
+        - git_cmd: 执行 Git 命令。
+        请严格按照任务要求，完成代码相关的工作。
+        **请始终使用中文进行回复。**
+      allowed_tools:
+        - run_code
+        - read_file
+        - write_file
+        - git_cmd
+    researcher:
+      role: "researcher"
+      system_prompt: |
+        你是一个“查资料的”Agent，你的任务是根据“包工头”Agent 分配的任务，完成信息检索工作。
+        你可以使用的工具包括：
+        - web_search: 搜索互联网获取实时信息。
+        - knowledge_search: 搜索本地知识库获取项目文档或特定领域知识。
+        请根据任务的性质，合理选择并调用工具。在收到搜索结果后，请对结果进行总结和提炼，然后返回最核心的信息。如果一个工具调用失败，请尝试使用另一个工具。不要重复进行相同的搜索。
+        **请始终使用中文进行回复。**
+      allowed_tools:
+        - web_search
+        - knowledge_search
+
+sandbox:
+  max_concurrency: 5
+  default_timeout: 60
+  max_timeout: 300
+  memory_mb: 256
+  cpu_quota: 0.5
+
+tool_validation:
+  keywords:
+    read_file: ["file", "read", "write", "save", "open", "path", "tệp", "đọc", "ghi", "lưu", "mở", "đường dẫn", "文件", "读取", "写入", "保存", "路径", "打开"]
+    write_file: ["file", "read", "write", "save", "open", "path", "tệp", "đọc", "ghi", "lưu", "mở", "đường dẫn", "文件", "读取", "写入", "保存", "路径", "打开"]
+    run_code: ["run", "execute", "code", "script", "chạy", "thực thi", "mã", "运行", "执行", "代码", "开发", "写", "编写", "implement", "develop", "write"]
+    create_session: ["session", "conversation", "chat", "topic", "switch", "hội thoại", "chủ đề", "trò chuyện", "chuyển", "会话", "聊天", "主题", "切换"]
+    switch_session: ["session", "conversation", "chat", "topic", "switch", "hội thoại", "chủ đề", "trò chuyện", "chuyển", "会话", "聊天", "主题", "切换"]
+    web_search: ["search", "find", "what is", "how to", "who is", "tell me about", "usage", "guide", "tutorial", "用法", "教程", "指南", "搜索", "查找", "是什么", "如何", "谁是", "告诉我关于", "查询", "信息", "资料"]
+    knowledge_search: ["search", "find", "what is", "how to", "who is", "tell me about", "tìm", "là gì", "hướng dẫn", "ai là", "kể cho tôi về", "搜索", "查找", "是什么", "如何", "谁是", "告诉我关于"]
+    call_coder: ["code", "implement", "write", "develop", "example", "demo", "代码", "实现", "编写", "开发", "例子", "演示"]
+    call_researcher: ["search", "find", "what is", "how to", "who is", "tell me about", "research", "搜索", "查找", "是什么", "如何", "谁是", "告诉我关于", "研究"]

@@ -33,6 +33,9 @@ import (
 // config: 应用程序配置
 // sandboxOnce: 用于确保沙箱初始化只执行一次
 // runCodeSandboxSemaphore: 用于控制代码沙箱并发执行的信号量
+// role: Agent 的角色
+// allowedTools: 该 Agent 允许使用的工具
+// otherAgents: 其他 Agent 实例的引用，用于多 Agent 协作
 type Agent struct {
 	llm                     LLMProvider
 	mem                     *MemoryV3
@@ -44,6 +47,9 @@ type Agent struct {
 	config                  Config
 	sandboxOnce             sync.Once
 	runCodeSandboxSemaphore chan struct{}
+	role                    string
+	allowedTools            map[string]bool
+	otherAgents             map[string]*Agent
 }
 
 // NewAgent 创建新的代理实例
@@ -51,31 +57,60 @@ type Agent struct {
 // m: MemoryV3 实例
 // vs: VectorStore 接口实现
 // cfg: 应用程序配置
-func NewAgent(l LLMProvider, m *MemoryV3, vs VectorStore, cfg Config) *Agent {
+// agentConfig: Agent 的特定配置
+func NewAgent(l LLMProvider, m *MemoryV3, vs VectorStore, cfg Config, agentConfig AgentConfig) *Agent {
+	allowedTools := make(map[string]bool)
+	for _, toolName := range agentConfig.AllowedTools {
+		allowedTools[toolName] = true
+	}
+
+	prompts := NewPromptManager("")
+	if agentConfig.SystemPrompt != "" {
+		prompts.SetSystemPrompt(agentConfig.SystemPrompt)
+	}
+
 	a := &Agent{
 		llm:                 l,
 		mem:                 m,
-		prompts:             NewPromptManager(""),
+		prompts:             prompts,
 		vectorStore:         vs,
 		maxIterations:       cfg.Agent.MaxIterations,
 		toolRegistry:        NewToolRegistry(),
 		confirmationManager: NewConfirmationManager(),
 		config:              cfg,
+		role:                agentConfig.Role,
+		allowedTools:        allowedTools,
+		otherAgents:         make(map[string]*Agent), // 初始化为空 map
 	}
-	a.registerDefaultTools() // 注册默认工具
+	a.registerTools() // 注册工具
 	return a
 }
 
-// registerDefaultTools 注册系统默认工具到代理的工具注册表中
-func (a *Agent) registerDefaultTools() {
-	a.toolRegistry.Register(&WebSearchTool{})
-	a.toolRegistry.Register(&RunCodeTool{})
-	a.toolRegistry.Register(&ReadFileTool{})
-	a.toolRegistry.Register(&WriteFileTool{})
-	a.toolRegistry.Register(&GitCmdTool{})
-	a.toolRegistry.Register(&CreateSessionTool{})
-	a.toolRegistry.Register(&SwitchSessionTool{})
-	a.toolRegistry.Register(&KnowledgeSearchTool{})
+// SetOtherAgents 设置其他 Agent 实例的引用
+func (a *Agent) SetOtherAgents(otherAgents map[string]*Agent) {
+	a.otherAgents = otherAgents
+}
+
+// registerTools 根据 Agent 的 allowedTools 字段注册工具
+func (a *Agent) registerTools() {
+	allTools := []Tool{
+		&WebSearchTool{},
+		&RunCodeTool{},
+		&ReadFileTool{},
+		&WriteFileTool{},
+		&GitCmdTool{},
+		&CreateSessionTool{},
+		&SwitchSessionTool{},
+		&KnowledgeSearchTool{},
+		&CallCoderTool{},
+		&CallResearcherTool{},
+	}
+
+	for _, tool := range allTools {
+		if a.allowedTools[tool.Name()] {
+			a.toolRegistry.Register(tool)
+		}
+	}
 }
 
 // GetMemory 获取Agent的内存实例
@@ -301,25 +336,10 @@ func (a *Agent) handleToolCalls(ctx context.Context, toolCalls []ToolCall, sessi
 			argsBytes, _ := json.Marshal(tc.Function.Arguments)
 			fc := &FunctionCall{Name: tc.Function.Name, Arguments: argsBytes}
 
-			toolPipeReader, toolPipeWriter := io.Pipe() // 创建管道用于工具的流式输出
 			var toolResult string
 			var toolErr error
-			var execWg sync.WaitGroup
-
-			execWg.Add(1)
-			// 在 goroutine 中执行工具
-			go func() {
-				defer execWg.Done()
-				toolResult, toolErr = a.execTool(ctx, fc, sessionID, toolPipeWriter)
-			}()
-
-			// 扫描工具的流式输出并转发给前端
-			toolOutputScanner := bufio.NewScanner(toolPipeReader)
-			for toolOutputScanner.Scan() {
-				outputChunk := toolOutputScanner.Text()
-				events <- StreamEvent{Type: "tool_output", Payload: ToolOutputEventPayload{ToolName: tc.Function.Name, Output: outputChunk}}
-			}
-			execWg.Wait() // 等待工具执行完成
+			// 执行工具
+			toolResult, toolErr = a.execTool(ctx, fc, sessionID, events)
 
 			// 发送工具结束执行事件
 			events <- StreamEvent{Type: "tool_end", Payload: ToolCallEventPayload{ToolName: tc.Function.Name}}
@@ -537,7 +557,7 @@ func extractToolCallsFromContent(content string) []ToolCall {
 }
 
 // execTool 执行指定的工具函数
-func (a *Agent) execTool(ctx context.Context, fc *FunctionCall, sessionID string, stream io.Writer) (string, error) {
+func (a *Agent) execTool(ctx context.Context, fc *FunctionCall, sessionID string, events chan<- StreamEvent) (string, error) {
 	ctx, span := tracer.Start(ctx, "Agent.execTool",
 		trace.WithAttributes(
 			attribute.String("tool.name", fc.Name),
@@ -555,7 +575,7 @@ func (a *Agent) execTool(ctx context.Context, fc *FunctionCall, sessionID string
 		return err.Error(), nil // 将错误作为结果返回给 LLM
 	}
 	// 运行工具
-	res, err := tool.Run(ctx, string(fc.Arguments), sessionID, a, stream)
+	res, err := tool.Run(ctx, string(fc.Arguments), sessionID, a, events)
 	if err != nil {
 		Logger.Error().Err(err).Str("tool_name", fname).Msg("Tool execution failed")
 		span.RecordError(err)

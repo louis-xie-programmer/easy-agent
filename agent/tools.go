@@ -133,7 +133,7 @@ func (t *WebSearchTool) Schema() map[string]any {
 	}
 }
 func (t *WebSearchTool) IsSensitive() bool { return false }
-func (t *WebSearchTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ io.Writer) (string, error) {
+func (t *WebSearchTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, events chan<- StreamEvent) (string, error) {
 	_, span := tracer.Start(ctx, "Tool.WebSearch")
 	defer span.End()
 
@@ -150,7 +150,13 @@ func (t *WebSearchTool) Run(ctx context.Context, argsJSON string, _ string, _ *A
 	if err != nil {
 		return "", err
 	}
-	return MarshalArgs(results), nil
+
+	var sb strings.Builder
+	for _, res := range results {
+		sb.WriteString(fmt.Sprintf("Title: %s\nLink: %s\nSnippet: %s\n\n", res.Title, res.Link, res.Snippet))
+	}
+
+	return sb.String(), nil
 }
 
 type RunCodeTool struct{}
@@ -171,7 +177,7 @@ func (t *RunCodeTool) Schema() map[string]any {
 	}
 }
 func (t *RunCodeTool) IsSensitive() bool { return true }
-func (t *RunCodeTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, stream io.Writer) (string, error) {
+func (t *RunCodeTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, events chan<- StreamEvent) (string, error) {
 	_, span := tracer.Start(ctx, "Tool.RunCode")
 	defer span.End()
 
@@ -181,7 +187,24 @@ func (t *RunCodeTool) Run(ctx context.Context, argsJSON string, _ string, a *Age
 	}
 	span.SetAttributes(attribute.String("language", args.Language))
 
-	return a.RunCodeSandbox(args, stream)
+	// 创建一个 io.Writer，将沙箱输出转发到 events 通道
+	pipeReader, pipeWriter := io.Pipe()
+	go func() {
+		defer pipeWriter.Close()
+		scanner := bufio.NewScanner(pipeReader)
+		for scanner.Scan() {
+			events <- StreamEvent{Type: "tool_output", Payload: ToolOutputEventPayload{ToolName: t.Name(), Output: scanner.Text()}}
+		}
+		if err := scanner.Err(); err != nil {
+			Logger.Error().Err(err).Str("tool_name", t.Name()).Msg("Error reading from sandbox output pipe")
+		}
+	}()
+
+	result, err := a.RunCodeSandbox(args, pipeWriter)
+	if err != nil {
+		return "", err
+	}
+	return result, nil
 }
 
 type ReadFileTool struct{}
@@ -200,7 +223,7 @@ func (t *ReadFileTool) Schema() map[string]any {
 	}
 }
 func (t *ReadFileTool) IsSensitive() bool { return false }
-func (t *ReadFileTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ io.Writer) (string, error) {
+func (t *ReadFileTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ chan<- StreamEvent) (string, error) {
 	_, span := tracer.Start(ctx, "Tool.ReadFile")
 	defer span.End()
 
@@ -231,7 +254,7 @@ func (t *WriteFileTool) Schema() map[string]any {
 	}
 }
 func (t *WriteFileTool) IsSensitive() bool { return true }
-func (t *WriteFileTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ io.Writer) (string, error) {
+func (t *WriteFileTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ chan<- StreamEvent) (string, error) {
 	_, span := tracer.Start(ctx, "Tool.WriteFile")
 	defer span.End()
 
@@ -261,7 +284,7 @@ func (t *GitCmdTool) Schema() map[string]any {
 	}
 }
 func (t *GitCmdTool) IsSensitive() bool { return false }
-func (t *GitCmdTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ io.Writer) (string, error) {
+func (t *GitCmdTool) Run(ctx context.Context, argsJSON string, _ string, _ *Agent, _ chan<- StreamEvent) (string, error) {
 	_, span := tracer.Start(ctx, "Tool.GitCmd")
 	defer span.End()
 
@@ -290,7 +313,7 @@ func (t *CreateSessionTool) Schema() map[string]any {
 	}
 }
 func (t *CreateSessionTool) IsSensitive() bool { return false }
-func (t *CreateSessionTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, _ io.Writer) (string, error) {
+func (t *CreateSessionTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, _ chan<- StreamEvent) (string, error) {
 	_, span := tracer.Start(ctx, "Tool.CreateSession")
 	defer span.End()
 
@@ -322,7 +345,7 @@ func (t *SwitchSessionTool) Schema() map[string]any {
 	}
 }
 func (t *SwitchSessionTool) IsSensitive() bool { return false }
-func (t *SwitchSessionTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, _ io.Writer) (string, error) {
+func (t *SwitchSessionTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, _ chan<- StreamEvent) (string, error) {
 	_, span := tracer.Start(ctx, "Tool.SwitchSession")
 	defer span.End()
 
@@ -357,7 +380,7 @@ func (t *KnowledgeSearchTool) Schema() map[string]any {
 	}
 }
 func (t *KnowledgeSearchTool) IsSensitive() bool { return false }
-func (t *KnowledgeSearchTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, _ io.Writer) (string, error) {
+func (t *KnowledgeSearchTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, _ chan<- StreamEvent) (string, error) {
 	_, span := tracer.Start(ctx, "Tool.KnowledgeSearch")
 	defer span.End()
 
@@ -391,6 +414,146 @@ func (t *KnowledgeSearchTool) Run(ctx context.Context, argsJSON string, _ string
 		sb.WriteString(fmt.Sprintf("[%d] (Similarity: %.2f)\n%s\n\n", i+1, res.Score, res.Doc.Content))
 	}
 	return sb.String(), nil
+}
+
+// =================================================================================
+//
+//	Multi-Agent Tools
+//
+// =================================================================================
+
+type CallCoderTool struct{}
+
+func (t *CallCoderTool) Name() string { return "call_coder" }
+func (t *CallCoderTool) Description() string {
+	return "Delegates a coding task to the Coder Agent. Use this for writing, modifying, or reviewing code."
+}
+func (t *CallCoderTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"task": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"type":        map[string]any{"type": "string", "description": "The type of task, e.g., 'string'"},
+					"description": map[string]any{"type": "string", "description": "The coding task to be performed."},
+				},
+				"required": []string{"type", "description"},
+			},
+		},
+		"required": []string{"task"},
+	}
+}
+func (t *CallCoderTool) IsSensitive() bool { return false }
+func (t *CallCoderTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, events chan<- StreamEvent) (string, error) {
+	var args struct {
+		Task struct {
+			Type        string `json:"type"`
+			Description string `json:"description"`
+		} `json:"task"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+
+	Logger.Info().Str("foreman_agent", a.role).Str("coder_task", args.Task.Description).Msg("Foreman calling Coder Agent")
+
+	coderAgent, ok := a.otherAgents["coder"]
+	if !ok {
+		Logger.Error().Str("foreman_agent", a.role).Msg("Coder agent not found in otherAgents map")
+		return "", fmt.Errorf("coder agent not found")
+	}
+
+	subAgentEvents := make(chan StreamEvent)
+	go coderAgent.StreamRunWithSessionAndImages(ctx, args.Task.Description, "", nil, "", subAgentEvents)
+
+	var finalAnswer strings.Builder
+	for event := range subAgentEvents {
+		// 将子 Agent 的所有事件转发到 Foreman 的 events 通道
+		events <- event
+
+		// 同时收集最终答案或错误
+		if event.Type == "token" {
+			if p, ok := event.Payload.(TokenEventPayload); ok {
+				finalAnswer.WriteString(p.Text)
+			}
+		} else if event.Type == "error" {
+			if p, ok := event.Payload.(ErrorEventPayload); ok {
+				Logger.Error().Str("coder_agent_error", p.Message).Msg("Coder Agent returned an error")
+				return "", fmt.Errorf("coder agent error: %s", p.Message)
+			}
+		}
+	}
+
+	Logger.Info().Str("foreman_agent", a.role).Str("coder_result_preview", truncateString(finalAnswer.String(), 100)).Msg("Coder Agent returned result")
+	return finalAnswer.String(), nil
+}
+
+type CallResearcherTool struct{}
+
+func (t *CallResearcherTool) Name() string { return "call_researcher" }
+func (t *CallResearcherTool) Description() string {
+	return "Delegates a research task to the Researcher Agent. Use this for searching the web or knowledge base."
+}
+func (t *CallResearcherTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"task": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"type":        map[string]any{"type": "string", "description": "The type of task, e.g., 'string'"},
+					"description": map[string]any{"type": "string", "description": "The research task to be performed."},
+				},
+				"required": []string{"type", "description"},
+			},
+		},
+		"required": []string{"task"},
+	}
+}
+func (t *CallResearcherTool) IsSensitive() bool { return false }
+func (t *CallResearcherTool) Run(ctx context.Context, argsJSON string, _ string, a *Agent, events chan<- StreamEvent) (string, error) {
+	var args struct {
+		Task struct {
+			Type        string `json:"type"`
+			Description string `json:"description"`
+		} `json:"task"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		return "", fmt.Errorf("invalid args: %v", err)
+	}
+
+	Logger.Info().Str("foreman_agent", a.role).Str("researcher_task", args.Task.Description).Msg("Foreman calling Researcher Agent")
+
+	researcherAgent, ok := a.otherAgents["researcher"]
+	if !ok {
+		Logger.Error().Str("foreman_agent", a.role).Msg("Researcher agent not found in otherAgents map")
+		return "", fmt.Errorf("researcher agent not found")
+	}
+
+	subAgentEvents := make(chan StreamEvent)
+	go researcherAgent.StreamRunWithSessionAndImages(ctx, args.Task.Description, "", nil, "", subAgentEvents)
+
+	var finalAnswer strings.Builder
+	for event := range subAgentEvents {
+		// 将子 Agent 的所有事件转发到 Foreman 的 events 通道
+		events <- event
+
+		// 同时收集最终答案或错误
+		if event.Type == "token" {
+			if p, ok := event.Payload.(TokenEventPayload); ok {
+				finalAnswer.WriteString(p.Text)
+			}
+		} else if event.Type == "error" {
+			if p, ok := event.Payload.(ErrorEventPayload); ok {
+				Logger.Error().Str("researcher_agent_error", p.Message).Msg("Researcher Agent returned an error")
+				return "", fmt.Errorf("researcher agent error: %s", p.Message)
+			}
+		}
+	}
+
+	Logger.Info().Str("foreman_agent", a.role).Str("researcher_result_preview", truncateString(finalAnswer.String(), 100)).Msg("Researcher Agent returned result")
+	return finalAnswer.String(), nil
 }
 
 // =================================================================================

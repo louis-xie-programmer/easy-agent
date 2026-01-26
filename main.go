@@ -69,13 +69,29 @@ func main() {
 
 	// 创建 Ollama 客户端，用于与大语言模型交互
 	ollama := agent.NewOllamaClient(cfg)
-	// 创建 Agent 核心实例，协调 LLM、记忆、工具和向量存储
-	a := agent.NewAgent(ollama, mem, vectorStore, cfg)
+
+	// --- 多 Agent 初始化 ---
+	// 第一阶段：创建所有 Agent 实例
+	agents := make(map[string]*agent.Agent)
+	for name, agentConfig := range cfg.Agent.Agents {
+		agents[name] = agent.NewAgent(ollama, mem, vectorStore, cfg, agentConfig)
+	}
+
+	// 第二阶段：为每个 Agent 注入其他 Agent 的引用
+	for _, a := range agents {
+		a.SetOtherAgents(agents)
+	}
+
+	// 获取 "foreman" Agent 作为主 Agent
+	foremanAgent, ok := agents["foreman"]
+	if !ok {
+		agent.Logger.Fatal().Msg("foreman agent not found in config")
+	}
 
 	// 创建一个新的 HTTP 路由器
 	r := mux.NewRouter()
 	// 注册所有 HTTP 路由和处理器
-	web.RegisterRoutes(r, a, cfg)
+	web.RegisterRoutes(r, foremanAgent, cfg)
 
 	// 配置 CORS (跨域资源共享) 中间件
 	// 允许所有来源、所有常用 HTTP 方法和指定头部，在生产环境中应根据实际需求限制 AllowedOrigins

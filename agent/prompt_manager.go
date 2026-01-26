@@ -10,8 +10,9 @@ import (
 
 // PromptManager 管理提示词模板
 type PromptManager struct {
-	promptsDir string
-	templates  map[string]*template.Template
+	promptsDir   string
+	templates    map[string]*template.Template
+	systemPrompt string // 用于存储自定义的系统提示词
 }
 
 // NewPromptManager 创建新的提示词管理器
@@ -20,9 +21,15 @@ func NewPromptManager(dir string) *PromptManager {
 		dir = "./prompts"
 	}
 	return &PromptManager{
-		promptsDir: dir,
-		templates:  make(map[string]*template.Template),
+		promptsDir:   dir,
+		templates:    make(map[string]*template.Template),
+		systemPrompt: "", // 默认为空
 	}
+}
+
+// SetSystemPrompt 设置自定义的系统提示词
+func (pm *PromptManager) SetSystemPrompt(prompt string) {
+	pm.systemPrompt = prompt
 }
 
 // Load 加载指定名称的提示词模板
@@ -66,7 +73,12 @@ type DefaultSystemPromptData struct {
 }
 
 // GetSystemPrompt 获取渲染后的系统提示词
+// 如果设置了自定义系统提示词，则返回自定义提示词；否则渲染默认模板
 func (pm *PromptManager) GetSystemPrompt() string {
+	if pm.systemPrompt != "" {
+		return pm.systemPrompt
+	}
+
 	data := DefaultSystemPromptData{
 		Time: time.Now().Format("2006-01-02 15:04:05"),
 	}

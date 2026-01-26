@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"io"
 	"sync"
 )
 
@@ -21,9 +20,9 @@ type Tool interface {
 	// argsJSON: 大语言模型生成的 JSON 格式参数字符串。
 	// sessionID: 当前会话的唯一标识符，某些工具可能需要会话上下文。
 	// agent: Agent 实例的引用，允许工具反向调用 Agent 的其他能力（例如，创建新会话、访问内存或向量存储）。
-	// stream: 用于流式写入工具执行过程中的中间输出或日志。
+	// events: 用于流式写入工具执行过程中的事件。
 	// 返回工具执行的结果字符串和可能发生的错误。
-	Run(ctx context.Context, argsJSON string, sessionID string, agent *Agent, stream io.Writer) (string, error)
+	Run(ctx context.Context, argsJSON string, sessionID string, agent *Agent, events chan<- StreamEvent) (string, error)
 }
 
 // ToolRegistry 管理所有可用工具的注册和查找。
